@@ -68,7 +68,19 @@ export class PersistentGeminiSession extends BaseOneShotSession {
 
       const proc = spawn(this.engineBin, args, {
         cwd: this.options.cwd,
-        env: { ...process.env },
+        // SECURITY FIX: allowlist env vars instead of inheriting all
+        env: {
+          PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+          HOME: process.env.HOME,
+          USER: process.env.USER,
+          SHELL: process.env.SHELL,
+          LANG: process.env.LANG,
+          TERM: process.env.TERM || 'xterm-256color',
+          TMPDIR: process.env.TMPDIR,
+          GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+          GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+          NODE_ENV: process.env.NODE_ENV,
+        },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;

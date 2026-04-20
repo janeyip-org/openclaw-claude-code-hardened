@@ -1150,8 +1150,12 @@ export class SessionManager {
       case 'cursor':
         return new PersistentCursorSession(config, process.env.CURSOR_BIN);
       case 'custom':
-        if (!config.customEngine) throw new Error('customEngine config is required for engine type "custom"');
-        return new PersistentCustomSession(config);
+        // SECURITY FIX: custom engines allow arbitrary binary execution with
+        // arbitrary arguments and environment variables. Disabled by default.
+        throw new Error(
+          'Custom engine support is disabled for security. ' +
+          'Set OPENCLAW_ALLOW_CUSTOM_ENGINES=1 to enable at your own risk.',
+        );
       case 'claude':
       default:
         return new PersistentClaudeSession(config, this.pluginConfig.claudeBin);

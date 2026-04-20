@@ -579,7 +579,10 @@ export async function handleChatCompletion(
       cwd: sessionCwd,
       engine,
       model: resolvedModel,
-      permissionMode: 'bypassPermissions',
+      // SECURITY FIX: use 'acceptEdits' instead of 'bypassPermissions'.
+      // The original hardcoded 'bypassPermissions' allowed any caller
+      // (including cross-origin requests) to execute arbitrary commands.
+      permissionMode: 'acceptEdits',
       // skipPersistence: tells SessionManager not to write this session to
       // the disk registry, preventing auto-resume of stale sessions.
       // Note: noSessionPersistence (--no-session-persistence) is NOT set

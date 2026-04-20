@@ -28,7 +28,14 @@ export class InboxManager {
   wrapCrossSessionMessage(msg: InboxMessage): string {
     const esc = InboxManager.escapeXmlAttr;
     const attrs = `from="${esc(msg.from)}"${msg.summary ? ` summary="${esc(msg.summary)}"` : ''}`;
-    return `<cross-session-message ${attrs}>\n${msg.text}\n</cross-session-message>`;
+    // SECURITY FIX: escape message body to prevent prompt injection.
+    // Without this, a malicious session can craft a body containing
+    // </cross-session-message> followed by arbitrary content, injecting
+    // fake system messages into other sessions.
+    const safeText = msg.text
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return `<cross-session-message ${attrs}>\n${safeText}\n</cross-session-message>`;
   }
 
   /**

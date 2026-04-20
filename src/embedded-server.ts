@@ -127,9 +127,11 @@ export class EmbeddedServer {
     const origin = req.headers.origin || '';
     const urlPath = new URL(req.url || '/', `http://localhost:${this.port}`).pathname;
     const corsAllowAll = process.env.OPENCLAW_CORS_ORIGINS === '*';
-    const isV1Path = urlPath.startsWith('/v1/');
+    // SECURITY FIX: removed isV1Path — /v1/ paths no longer get blanket CORS.
+    // Without this, any website could make cross-origin requests to the local
+    // server, bypassing the localhost-only security boundary.
     const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$/.test(origin);
-    if (isLocalhost || isV1Path || corsAllowAll) {
+    if (isLocalhost || corsAllowAll) {
       res.setHeader('Access-Control-Allow-Origin', origin || '*');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -146,7 +148,9 @@ export class EmbeddedServer {
     // Bearer token auth (skip for health checks)
     if (this.authToken && path !== '/health') {
       const authHeader = req.headers.authorization || '';
-      if (authHeader !== `Bearer ${this.authToken}`) {
+      const expected = Buffer.from(`Bearer ${this.authToken}`);
+      const received = Buffer.from(authHeader);
+      if (expected.length !== received.length || !require('node:crypto').timingSafeEqual(expected, received)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'Unauthorized — provide Authorization: Bearer <token>' }));
         return;

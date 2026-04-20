@@ -472,7 +472,9 @@ export class Council extends EventEmitter {
           engine,
           model: agent.model,
           baseUrl: agent.baseUrl,
-          permissionMode: agent.permissionMode ?? this.config.defaultPermissionMode ?? 'bypassPermissions',
+          // SECURITY FIX: default to 'acceptEdits' instead of 'bypassPermissions'.
+          // Council agents should not have unrestricted access by default.
+          permissionMode: agent.permissionMode ?? this.config.defaultPermissionMode ?? 'acceptEdits',
           appendSystemPrompt: systemPrompt,
           maxTurns: this.config.maxTurnsPerAgent || DEFAULT_MAX_TURNS_PER_AGENT,
           maxBudgetUsd: this.config.maxBudgetUsd,

@@ -252,9 +252,26 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // Build spawn environment
     // Preserve the parent process PATH so the resolved binary and any PATH-relative
     // tools (git, node, npm, etc.) remain accessible on all platforms and distros.
+    // SECURITY FIX: allowlist environment variables instead of inheriting all.
+    // The original `...process.env` leaked every env var (DB passwords, cloud
+    // credentials, etc.) to every spawned CLI subprocess.
     const spawnEnv: NodeJS.ProcessEnv = {
-      ...process.env,
       PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+      HOME: process.env.HOME,
+      USER: process.env.USER,
+      SHELL: process.env.SHELL,
+      LANG: process.env.LANG,
+      TERM: process.env.TERM || 'xterm-256color',
+      TMPDIR: process.env.TMPDIR,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+      // Claude-specific
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      CLAUDE_CODE_USE_BEDROCK: process.env.CLAUDE_CODE_USE_BEDROCK,
+      CLAUDE_CODE_USE_VERTEX: process.env.CLAUDE_CODE_USE_VERTEX,
+      // Node
+      NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE,
+      NODE_ENV: process.env.NODE_ENV,
     };
     if (this.options.baseUrl) spawnEnv.ANTHROPIC_BASE_URL = this.options.baseUrl;
     if (this.options.enableAgentTeams) spawnEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = 'true';
