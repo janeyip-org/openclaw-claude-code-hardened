@@ -393,6 +393,15 @@ function buildSystemPrompt(agent: AgentPersona, allAgents: AgentPersona[], workt
     .replace(/\{\{otherBranches\}\}/g, otherBranches);
 }
 
+// ─── Session Reuse ──────────────────────────────────────────────────────────
+
+/** Claude engine keeps a long-running process — reusing sessions across rounds
+ *  maximizes Anthropic prompt caching (cached input tokens are 90% cheaper).
+ *  Gemini/Codex/Cursor are one-shot (new process per send) — no cache benefit. */
+function isReusableEngine(engine: EngineType | undefined): boolean {
+  return !engine || engine === 'claude';
+}
+
 // ─── Council Engine ─────────────────────────────────────────────────────────
 
 export class Council extends EventEmitter {
@@ -401,6 +410,8 @@ export class Council extends EventEmitter {
   private agentTimeoutMs: number;
   private _aborted = false;
   private _activeSessions = new Set<string>();
+  /** Sessions kept alive across rounds for prompt caching (Claude only) */
+  private _persistentSessions = new Set<string>();
   private _session: CouncilSession | null = null;
   private _pendingInjection: string | null = null;
   private logger: Logger;
@@ -427,6 +438,11 @@ export class Council extends EventEmitter {
       this.manager.stopSession(name).catch(() => {});
     }
     this._activeSessions.clear();
+    // Also stop persistent sessions kept alive across rounds
+    for (const name of this._persistentSessions) {
+      this.manager.stopSession(name).catch(() => {});
+    }
+    this._persistentSessions.clear();
   }
 
   private emitEvent(event: Omit<CouncilEvent, 'timestamp'>) {
@@ -446,7 +462,14 @@ export class Council extends EventEmitter {
   ): Promise<AgentResponse> {
     this.emitEvent({ type: 'agent-start', sessionId, round, agent: agent.name });
 
-    const sessionName = `council-${sessionId.slice(0, 8)}-${agent.name}-r${round}`;
+    const engine: EngineType = agent.engine || 'claude';
+    const reusable = isReusableEngine(engine);
+    // Reusable (Claude): stable name across rounds → session survives, prompt cache hits
+    // One-shot (Gemini/Codex): unique per round → killed after each round
+    const sessionName = reusable
+      ? `council-${sessionId.slice(0, 8)}-${agent.name}`
+      : `council-${sessionId.slice(0, 8)}-${agent.name}-r${round}`;
+    if (reusable) this._persistentSessions.add(sessionName);
     this._activeSessions.add(sessionName);
 
     let content = '';
@@ -464,8 +487,7 @@ export class Council extends EventEmitter {
           await sleep(EMPTY_RESPONSE_RETRY_DELAY_MS);
         }
 
-        // Start a session for this agent
-        const engine: EngineType = agent.engine || 'claude';
+        // Start a session for this agent (idempotent — returns existing on round 2+)
         await this.manager.startSession({
           name: sessionName,
           cwd: workDir,
@@ -522,8 +544,12 @@ export class Council extends EventEmitter {
         }
       }
     } finally {
-      // Stop session — fire-and-forget
-      this.manager.stopSession(sessionName).catch(() => {});
+      if (!reusable) {
+        // One-shot engines: stop after each round (no cache benefit)
+        this.manager.stopSession(sessionName).catch(() => {});
+      }
+      // Reusable engines: session stays alive for prompt caching across rounds.
+      // Cleaned up in run()'s finally block or abort().
       this._activeSessions.delete(sessionName);
     }
 
@@ -584,7 +610,7 @@ export class Council extends EventEmitter {
     this.logger.info(`Starting: ${this.config.agents.length} agents, max ${this.config.maxRounds} rounds`);
     this.logger.info(`Task: ${trimmedTask}`);
     this.logger.info(`Dir: ${this.config.projectDir}`);
-    this.logger.warn('Agents run with permissionMode=bypassPermissions for autonomous execution');
+    this.logger.info('Claude agents reuse sessions across rounds for prompt caching');
     this.emitEvent({ type: 'session-start', sessionId: session.id, task: trimmedTask });
 
     // Set up git worktrees
@@ -691,6 +717,12 @@ export class Council extends EventEmitter {
       session.endTime = new Date().toISOString();
       this.emitEvent({ type: 'error', sessionId: session.id, error: (err as Error).message });
       throw err;
+    } finally {
+      // Clean up persistent sessions kept alive across rounds for prompt caching
+      for (const name of this._persistentSessions) {
+        this.manager.stopSession(name).catch(() => {});
+      }
+      this._persistentSessions.clear();
     }
   }
 
