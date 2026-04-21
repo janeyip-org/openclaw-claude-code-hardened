@@ -1,0 +1,735 @@
+/**
+ * openclaw-claude-code — Plugin entry point
+ *
+ * Registers tools, hooks, and HTTP routes with the OpenClaw Plugin SDK.
+ * When used standalone (no OpenClaw), exports SessionManager for direct use.
+ *
+ * Lazy initialisation: SessionManager and EmbeddedServer are created only on
+ * the first tool call. While the plugin is registered but never used, it
+ * consumes no memory beyond the tool schema definitions.
+ */
+import { SessionManager } from './session-manager.js';
+import { createProxyHandler } from './proxy/handler.js';
+import { EmbeddedServer } from './embedded-server.js';
+import { sanitizeCwd, validateRegex } from './validation.js';
+// ─── Standalone Export ───────────────────────────────────────────────────────
+export { SessionManager } from './session-manager.js';
+export { PersistentClaudeSession } from './persistent-session.js';
+export { BaseOneShotSession } from './base-oneshot-session.js';
+export { PersistentCodexSession } from './persistent-codex-session.js';
+export { PersistentGeminiSession } from './persistent-gemini-session.js';
+export { PersistentCursorSession } from './persistent-cursor-session.js';
+export { PersistentCustomSession } from './persistent-custom-session.js';
+export { Council, getDefaultCouncilConfig } from './council.js';
+export { parseConsensus, stripConsensusTags, hasConsensusMarker } from './consensus.js';
+export { sanitizeCwd, validateRegex, validateName } from './validation.js';
+export { createConsoleLogger, nullLogger } from './logger.js';
+export { CircuitBreaker } from './circuit-breaker.js';
+export { InboxManager } from './inbox-manager.js';
+export * from './types.js';
+/**
+ * OpenClaw plugin object — standard format
+ */
+const plugin = {
+    id: 'openclaw-claude-code',
+    name: 'Claude Code SDK',
+    description: 'Full-featured Claude Code integration — session management, agent teams, worktree isolation, multi-model proxy',
+    register(api) {
+        const rawConfig = (api.pluginConfig || {});
+        // ─── Lazy Init ────────────────────────────────────────────────────────
+        //
+        // Neither SessionManager nor EmbeddedServer is created at plugin load
+        // time. They are initialised on the first tool invocation and reused
+        // thereafter. This keeps memory overhead at zero for users who have the
+        // plugin installed but do not actively use Claude Code sessions.
+        let manager = null;
+        let server = null;
+        function getManager() {
+            if (!manager) {
+                api.logger.info('[openclaw-claude-code] First use — initialising SessionManager and embedded server');
+                manager = new SessionManager(rawConfig);
+                server = new EmbeddedServer(manager);
+                server.start().catch((err) => api.logger.error('[openclaw-claude-code] Embedded server failed to start:', err));
+            }
+            return manager;
+        }
+        // ─── Service Lifecycle ────────────────────────────────────────────────
+        api.registerService({
+            id: 'openclaw-claude-code',
+            start: () => api.logger.info('[openclaw-claude-code] Plugin registered (lazy init — will activate on first use)'),
+            stop: () => {
+                if (server)
+                    server.stop().catch(() => { });
+                if (manager)
+                    manager.shutdown().catch(() => { });
+                server = null;
+                manager = null;
+            },
+        });
+        // ─── Proxy HTTP Route (multi-model support) ───────────────────────────
+        //
+        // The proxy route handler itself is lightweight (just an HTTP handler
+        // function); registering it eagerly is fine. The heavy proxy work only
+        // happens when a request actually arrives.
+        if (rawConfig.proxy?.enabled !== false) {
+            const proxyHandler = createProxyHandler(rawConfig.proxy, {
+                anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+                openaiApiKey: process.env.OPENAI_API_KEY,
+                geminiApiKey: process.env.GEMINI_API_KEY,
+                gatewayUrl: process.env.GATEWAY_URL,
+                gatewayKey: process.env.GATEWAY_KEY,
+            });
+            api.registerHttpRoute({
+                path: '/v1/claude-code-proxy',
+                auth: 'gateway',
+                match: 'prefix',
+                handler: proxyHandler,
+            });
+        }
+        // ─── Tool: claude_session_start ──────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_start',
+            description: 'Start a persistent coding session. Supports multiple engines: claude (default) for Claude Code CLI, codex for OpenAI Codex CLI, gemini for Google Gemini CLI, cursor for Cursor Agent CLI, or custom for any user-configured coding agent CLI.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name (auto-generated if omitted)' },
+                    cwd: { type: 'string', description: 'Working directory' },
+                    engine: {
+                        type: 'string',
+                        enum: ['claude', 'codex', 'gemini', 'cursor', 'custom'],
+                        description: 'Engine to use (default: claude). Use "custom" with customEngine config for any CLI.',
+                    },
+                    model: { type: 'string', description: 'Model to use (opus, sonnet, haiku, gemini-pro, o4-mini, etc.)' },
+                    permissionMode: {
+                        type: 'string',
+                        enum: ['acceptEdits', 'bypassPermissions', 'default', 'delegate', 'dontAsk', 'plan', 'auto'],
+                    },
+                    effort: { type: 'string', enum: ['low', 'medium', 'high', 'max', 'auto'] },
+                    allowedTools: { type: 'array', items: { type: 'string' }, description: 'Tools to auto-approve' },
+                    disallowedTools: { type: 'array', items: { type: 'string' }, description: 'Tools to deny' },
+                    maxTurns: { type: 'number', description: 'Max agent loop turns' },
+                    maxBudgetUsd: { type: 'number', description: 'Max API spend (USD)' },
+                    systemPrompt: { type: 'string', description: 'Replace system prompt' },
+                    appendSystemPrompt: { type: 'string', description: 'Append to system prompt' },
+                    agents: { type: 'object', description: 'Custom sub-agents JSON' },
+                    agent: { type: 'string', description: 'Default agent to use' },
+                    bare: { type: 'boolean', description: 'Minimal mode: skip hooks, LSP, auto-memory, CLAUDE.md' },
+                    worktree: { type: ['string', 'boolean'], description: 'Run in git worktree' },
+                    fallbackModel: { type: 'string', description: 'Auto fallback when primary overloaded' },
+                    jsonSchema: { type: 'string', description: 'JSON Schema for structured output' },
+                    mcpConfig: { type: ['string', 'array'], items: { type: 'string' }, description: 'MCP server config file(s)' },
+                    settings: { type: 'string', description: 'Settings.json path or inline JSON' },
+                    noSessionPersistence: { type: 'boolean', description: 'Do not save session to disk' },
+                    betas: { type: ['string', 'array'], items: { type: 'string' }, description: 'Custom beta headers' },
+                    enableAgentTeams: { type: 'boolean', description: 'Enable experimental agent teams' },
+                    enableAutoMode: { type: 'boolean', description: 'Enable auto permission mode' },
+                    includeHookEvents: { type: 'boolean', description: 'Stream hook lifecycle events (PreToolUse/PostToolUse)' },
+                    permissionPromptTool: {
+                        type: 'string',
+                        description: 'Delegate permission prompts to this MCP tool (non-interactive)',
+                    },
+                    excludeDynamicSystemPromptSections: {
+                        type: 'boolean',
+                        description: 'Move cwd/env/git from system prompt to user message for better prompt cache hits (auto-enabled with bare)',
+                    },
+                    debug: {
+                        type: ['string', 'array'],
+                        items: { type: 'string' },
+                        description: 'Debug categories (e.g. "api", "mcp", "!statsig")',
+                    },
+                    debugFile: { type: 'string', description: 'Write debug output to file instead of stderr' },
+                    fromPr: { type: 'string', description: 'Resume session linked to a GitHub PR number or URL' },
+                    channels: {
+                        type: ['string', 'array'],
+                        items: { type: 'string' },
+                        description: 'MCP channel subscriptions (research preview)',
+                    },
+                    dangerouslyLoadDevelopmentChannels: {
+                        type: ['string', 'array'],
+                        items: { type: 'string' },
+                        description: 'Load development MCP channels',
+                    },
+                    enablePromptCaching1H: {
+                        type: 'boolean',
+                        description: 'Enable 1-hour prompt cache TTL (auto-enabled with bare)',
+                    },
+                    customEngine: {
+                        type: 'object',
+                        description: 'Custom engine config (required when engine="custom"). Defines how to invoke any coding agent CLI.',
+                        properties: {
+                            name: { type: 'string', description: 'Engine display name' },
+                            bin: { type: 'string', description: 'Binary path or command' },
+                            binEnv: { type: 'string', description: 'Env var that overrides bin' },
+                            persistent: {
+                                type: 'boolean',
+                                description: 'true=long-running subprocess (Claude Code style), false=spawn per send (default)',
+                            },
+                            args: {
+                                type: 'object',
+                                description: 'CLI flag mappings',
+                                properties: {
+                                    print: { type: 'string' },
+                                    outputFormat: { type: 'string' },
+                                    outputFormatValue: { type: 'string' },
+                                    inputFormat: { type: 'string' },
+                                    inputFormatValue: { type: 'string' },
+                                    skipPermissions: { type: 'string' },
+                                    permissionMode: { type: 'string' },
+                                    model: { type: 'string' },
+                                    systemPrompt: { type: 'string' },
+                                    appendSystemPrompt: { type: 'string' },
+                                    maxTurns: { type: 'string' },
+                                    resume: { type: 'string' },
+                                    verbose: { type: 'string' },
+                                    replayUserMessages: { type: 'string' },
+                                    includePartialMessages: { type: 'string' },
+                                    effort: { type: 'string' },
+                                    workspace: { type: 'string' },
+                                    extra: { type: 'array', items: { type: 'string' } },
+                                },
+                            },
+                            permissionModes: { type: 'object', description: 'Map OpenClaw permission names to CLI values' },
+                            pricing: {
+                                type: 'object',
+                                properties: {
+                                    input: { type: 'number' },
+                                    output: { type: 'number' },
+                                    cached: { type: 'number' },
+                                },
+                            },
+                            contextWindow: { type: 'number' },
+                            env: { type: 'object', description: 'Extra environment variables' },
+                            sanitizePatterns: { type: 'array', items: { type: 'string' } },
+                        },
+                        required: ['name', 'bin', 'args'],
+                    },
+                    resumeSessionId: {
+                        type: 'string',
+                        description: 'Resume an existing Claude Code session by its ID (e.g. from ~/.claude/sessions/). Replays conversation history via session/load instead of starting fresh.',
+                    },
+                },
+            },
+            execute: async (_id, args) => {
+                const sanitized = { ...args };
+                if (sanitized.cwd)
+                    sanitized.cwd = sanitizeCwd(sanitized.cwd);
+                const info = await getManager().startSession(sanitized);
+                return { ok: true, ...info };
+            },
+        });
+        // ─── Tool: claude_session_send ───────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_send',
+            description: 'Send a message to a persistent Claude Code session and get the response',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    message: { type: 'string', description: 'Message to send' },
+                    effort: { type: 'string', enum: ['low', 'medium', 'high', 'max'], description: 'Effort for this message' },
+                    plan: { type: 'boolean', description: 'Enable plan mode' },
+                    timeout: { type: 'number', description: 'Timeout in ms (default 300000)' },
+                    stream: {
+                        type: 'boolean',
+                        description: 'Collect text chunks as they arrive and include them in result.chunks[] (default false). Note: OpenClaw plugin SDK does not yet support mid-tool streaming to the caller, so chunks are buffered and returned with the final result.',
+                    },
+                },
+                required: ['name', 'message'],
+            },
+            execute: async (_id, args) => {
+                const wantChunks = args.stream;
+                const chunks = [];
+                const result = await getManager().sendMessage(args.name, args.message, {
+                    effort: args.effort,
+                    plan: args.plan,
+                    timeout: args.timeout,
+                    // When stream:true, collect chunks into array for caller.
+                    // True mid-tool streaming requires SDK-level support (not yet available).
+                    onChunk: wantChunks
+                        ? (chunk) => {
+                            chunks.push(chunk);
+                        }
+                        : undefined,
+                });
+                return {
+                    ok: true,
+                    ...result,
+                    ...(wantChunks ? { chunks } : {}),
+                };
+            },
+        });
+        // ─── Tool: claude_session_stop ───────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_stop',
+            description: 'Stop a persistent Claude Code session',
+            parameters: {
+                type: 'object',
+                properties: { name: { type: 'string', description: 'Session name' } },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                await getManager().stopSession(args.name);
+                return { ok: true };
+            },
+        });
+        // ─── Tool: claude_session_list ───────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_list',
+            description: 'List all active Claude Code sessions',
+            parameters: { type: 'object', properties: {} },
+            execute: async (_id) => {
+                if (!manager)
+                    return { ok: true, sessions: [], persisted: [] };
+                return { ok: true, sessions: manager.listSessions(), persisted: manager.listPersistedSessions() };
+            },
+        });
+        // ─── Tool: claude_sessions_overview ──────────────────────────────────
+        api.registerTool({
+            name: 'claude_sessions_overview',
+            description: 'Get an aggregate overview of all active Claude Code sessions — readiness, busy/paused state, cost, context usage, and last activity for each. Use this for a dashboard view across all sessions. For single-session detail, use claude_session_status instead.',
+            parameters: { type: 'object', properties: {} },
+            execute: async (_id) => {
+                if (!manager)
+                    return { ok: true, version: 'unknown', sessions: 0, sessionNames: [], uptime: process.uptime(), details: [] };
+                return manager.health();
+            },
+        });
+        // ─── Tool: claude_session_status ─────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_status',
+            description: 'Get detailed status of a Claude Code session (context %, tokens, cost, uptime)',
+            parameters: {
+                type: 'object',
+                properties: { name: { type: 'string', description: 'Session name' } },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                const status = getManager().getStatus(args.name);
+                return { ok: true, ...status };
+            },
+        });
+        // ─── Tool: claude_session_grep ───────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_grep',
+            description: 'Search session history for events matching a regex pattern',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    pattern: { type: 'string', description: 'Regex pattern to search' },
+                    limit: { type: 'number', description: 'Max results (default 50)' },
+                },
+                required: ['name', 'pattern'],
+            },
+            execute: async (_id, args) => {
+                validateRegex(args.pattern);
+                const matches = await getManager().grepSession(args.name, args.pattern, args.limit);
+                return { ok: true, count: matches.length, matches };
+            },
+        });
+        // ─── Tool: claude_session_compact ────────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_compact',
+            description: 'Compact a session to reclaim context window space',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    summary: { type: 'string', description: 'Optional summary for compaction' },
+                },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                await getManager().compactSession(args.name, args.summary);
+                return { ok: true };
+            },
+        });
+        // ─── Tool: claude_agents_list ────────────────────────────────────────
+        api.registerTool({
+            name: 'claude_agents_list',
+            description: 'List agent definitions from .claude/agents/',
+            parameters: {
+                type: 'object',
+                properties: { cwd: { type: 'string', description: 'Project directory' } },
+            },
+            execute: async (_id, args) => {
+                const agents = getManager().listAgents(sanitizeCwd(args.cwd));
+                return { ok: true, agents };
+            },
+        });
+        // ─── Tool: claude_team_list ──────────────────────────────────────────
+        api.registerTool({
+            name: 'claude_team_list',
+            description: 'List teammates in an agent team session (requires enableAgentTeams)',
+            parameters: {
+                type: 'object',
+                properties: { name: { type: 'string', description: 'Session name' } },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                const response = await getManager().teamList(args.name);
+                return { ok: true, response };
+            },
+        });
+        // ─── Tool: claude_team_send ──────────────────────────────────────────
+        api.registerTool({
+            name: 'claude_team_send',
+            description: 'Send a message to a specific teammate in an agent team session',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    teammate: { type: 'string', description: 'Teammate name' },
+                    message: { type: 'string', description: 'Message to send' },
+                },
+                required: ['name', 'teammate', 'message'],
+            },
+            execute: async (_id, args) => {
+                const result = await getManager().teamSend(args.name, args.teammate, args.message);
+                return { ok: true, ...result };
+            },
+        });
+        // ─── Tool: claude_session_update_tools ───────────────────────────────
+        api.registerTool({
+            name: 'claude_session_update_tools',
+            description: 'Update allowedTools or disallowedTools for a running session. Restarts the session process with --resume to apply the new tool constraints while preserving conversation history. Rejects if the session is currently busy.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    allowedTools: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'New allowedTools list (replaces existing, or merges if merge:true)',
+                    },
+                    disallowedTools: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'New disallowedTools list (replaces existing, or merges if merge:true)',
+                    },
+                    removeTools: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Tools to remove from allowedTools/disallowedTools (applied after merge)',
+                    },
+                    merge: { type: 'boolean', description: 'Merge with existing lists instead of replacing (default false)' },
+                },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                const info = await getManager().updateTools(args.name, {
+                    allowedTools: args.allowedTools,
+                    disallowedTools: args.disallowedTools,
+                    removeTools: args.removeTools,
+                    merge: args.merge,
+                });
+                return { ok: true, restarted: true, ...info };
+            },
+        });
+        // ─── Tool: claude_session_switch_model ───────────────────────────────
+        api.registerTool({
+            name: 'claude_session_switch_model',
+            description: 'Switch the model for a running session immediately. Restarts the session process with --resume so the new model takes effect on the next message while preserving conversation history.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    model: { type: 'string', description: 'New model (opus, sonnet, haiku, gemini-pro, etc.)' },
+                },
+                required: ['name', 'model'],
+            },
+            execute: async (_id, args) => {
+                const info = await getManager().switchModel(args.name, args.model);
+                return { ok: true, restarted: true, ...info };
+            },
+        });
+        // ─── Tool: council_start ────────────────────────────────────────────
+        api.registerTool({
+            name: 'council_start',
+            description: 'Start a multi-agent council that collaborates on a task using git worktree isolation, round-based execution, and consensus voting. Agents can use different engines (Claude, Codex) and models.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    task: { type: 'string', description: 'Task description for the council to work on' },
+                    projectDir: { type: 'string', description: 'Working directory for the council project' },
+                    agents: {
+                        type: 'array',
+                        description: 'Agent personas. Defaults to 3-agent team (Planner, Generator, Evaluator) if omitted.',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                name: { type: 'string', description: 'Agent display name' },
+                                emoji: { type: 'string', description: 'Agent emoji identifier' },
+                                persona: { type: 'string', description: 'Agent personality/expertise description' },
+                                engine: {
+                                    type: 'string',
+                                    enum: ['claude', 'codex', 'gemini', 'cursor', 'custom'],
+                                    description: 'Engine (default: claude). Use "custom" with customEngine for any CLI.',
+                                },
+                                model: { type: 'string', description: 'Model to use' },
+                                baseUrl: { type: 'string', description: 'Custom API endpoint (for proxy)' },
+                                customEngine: { type: 'object', description: 'Custom engine config (when engine="custom")' },
+                            },
+                            required: ['name', 'emoji', 'persona'],
+                        },
+                    },
+                    maxRounds: { type: 'number', description: 'Max collaboration rounds (default 15)' },
+                    agentTimeoutMs: { type: 'number', description: 'Per-agent timeout in ms (default 1800000)' },
+                    maxTurnsPerAgent: { type: 'number', description: 'Max tool turns per agent per round (default 30)' },
+                    maxBudgetUsd: { type: 'number', description: 'Max API spend per agent (USD)' },
+                    defaultPermissionMode: {
+                        type: 'string',
+                        enum: ['acceptEdits', 'bypassPermissions', 'default', 'delegate', 'dontAsk', 'plan', 'auto'],
+                        description: 'Default permission mode for council agents (default: bypassPermissions)',
+                    },
+                },
+                required: ['task', 'projectDir'],
+            },
+            execute: async (_id, args) => {
+                const { getDefaultCouncilConfig } = await import('./council.js');
+                const projectDir = sanitizeCwd(args.projectDir);
+                const defaultConfig = getDefaultCouncilConfig(projectDir);
+                const config = {
+                    name: 'council',
+                    agents: args.agents || defaultConfig.agents,
+                    maxRounds: args.maxRounds ?? defaultConfig.maxRounds,
+                    projectDir,
+                    agentTimeoutMs: args.agentTimeoutMs,
+                    maxTurnsPerAgent: args.maxTurnsPerAgent,
+                    maxBudgetUsd: args.maxBudgetUsd,
+                    defaultPermissionMode: args.defaultPermissionMode,
+                };
+                const session = getManager().councilStart(args.task, config);
+                return { ok: true, ...session, note: 'Council running in background. Poll with council_status.' };
+            },
+        });
+        // ─── Tool: council_status ───────────────────────────────────────────
+        api.registerTool({
+            name: 'council_status',
+            description: 'Get the status of a running council session',
+            parameters: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Council session ID' } },
+                required: ['id'],
+            },
+            execute: async (_id, args) => {
+                const session = getManager().councilStatus(args.id);
+                if (!session)
+                    return { ok: false, error: 'Council not found' };
+                return { ok: true, ...session };
+            },
+        });
+        // ─── Tool: council_abort ────────────────────────────────────────────
+        api.registerTool({
+            name: 'council_abort',
+            description: 'Abort a running council, stopping all agent sessions',
+            parameters: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Council session ID' } },
+                required: ['id'],
+            },
+            execute: async (_id, args) => {
+                getManager().councilAbort(args.id);
+                return { ok: true };
+            },
+        });
+        // ─── Tool: council_inject ───────────────────────────────────────────
+        api.registerTool({
+            name: 'council_inject',
+            description: 'Inject a user message into the next round of a running council. The message will be appended to all agent prompts in the next round.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: 'Council session ID' },
+                    message: { type: 'string', description: 'Message to inject' },
+                },
+                required: ['id', 'message'],
+            },
+            execute: async (_id, args) => {
+                getManager().councilInject(args.id, args.message);
+                return { ok: true };
+            },
+        });
+        // ─── Tool: council_review ──────────────────────────────────────────
+        api.registerTool({
+            name: 'council_review',
+            description: 'Review a completed council session. Returns a structured report of all changed files, branches, worktrees, plan.md status, review files, and agent summaries. Does not modify any state — purely informational. Use this before deciding to accept or reject.',
+            parameters: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Council session ID' } },
+                required: ['id'],
+            },
+            execute: async (_id, args) => {
+                const result = await getManager().councilReview(args.id);
+                return { ok: true, ...result };
+            },
+        });
+        // ─── Tool: council_accept ──────────────────────────────────────────
+        api.registerTool({
+            name: 'council_accept',
+            description: 'Accept and finalize council work. Cleans up all council scaffolding: removes worktrees, deletes council/* branches, removes plan.md and reviews/ directory. Only call after reviewing with council_review.',
+            parameters: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Council session ID' } },
+                required: ['id'],
+            },
+            execute: async (_id, args) => {
+                const result = await getManager().councilAccept(args.id);
+                return { ok: true, ...result };
+            },
+        });
+        // ─── Tool: council_reject ──────────────────────────────────────────
+        api.registerTool({
+            name: 'council_reject',
+            description: 'Reject council work and provide feedback. Rewrites plan.md with rejection feedback and commits it. Does NOT delete any worktrees or branches — the council can be restarted to retry. Use this when the council output is incomplete or broken.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: 'Council session ID' },
+                    feedback: {
+                        type: 'string',
+                        description: 'Detailed feedback explaining why the work is rejected and what needs to be fixed',
+                    },
+                },
+                required: ['id', 'feedback'],
+            },
+            execute: async (_id, args) => {
+                const result = await getManager().councilReject(args.id, args.feedback);
+                return { ok: true, ...result };
+            },
+        });
+        // ─── Tool: claude_session_send_to ─────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_send_to',
+            description: 'Send a cross-session message from one session to another. If the target is idle, the message is delivered immediately. If busy, it is queued in the inbox for later delivery. Use "*" as target to broadcast to all other sessions.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    from: { type: 'string', description: 'Sender session name' },
+                    to: { type: 'string', description: 'Target session name, or "*" for broadcast' },
+                    message: { type: 'string', description: 'Message text' },
+                    summary: { type: 'string', description: 'Short preview (5-10 words)' },
+                },
+                required: ['from', 'to', 'message'],
+            },
+            execute: async (_id, args) => {
+                const result = await getManager().sessionSendTo(args.from, args.to, args.message, args.summary);
+                return { ok: true, ...result };
+            },
+        });
+        // ─── Tool: claude_session_inbox ──────────────────────────────────
+        api.registerTool({
+            name: 'claude_session_inbox',
+            description: 'Read inbox messages for a session. Returns unread messages by default.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Session name' },
+                    unreadOnly: { type: 'boolean', description: 'Only unread messages (default true)' },
+                },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                const messages = getManager().sessionInbox(args.name, args.unreadOnly ?? true);
+                return { ok: true, count: messages.length, messages };
+            },
+        });
+        // ─── Tool: claude_session_deliver_inbox ──────────────────────────
+        api.registerTool({
+            name: 'claude_session_deliver_inbox',
+            description: 'Deliver all queued inbox messages to an idle session. Call this when a session finishes a task to process waiting messages.',
+            parameters: {
+                type: 'object',
+                properties: { name: { type: 'string', description: 'Session name' } },
+                required: ['name'],
+            },
+            execute: async (_id, args) => {
+                const count = await getManager().sessionDeliverInbox(args.name);
+                return { ok: true, delivered: count };
+            },
+        });
+        // ─── Tool: ultraplan_start ──────────────────────────────────────
+        api.registerTool({
+            name: 'ultraplan_start',
+            description: 'Start an Ultraplan session: a dedicated Opus planning session that explores your project for up to 30 minutes and produces a detailed implementation plan. Runs in background.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    task: { type: 'string', description: 'What to plan — describe the feature, refactor, or problem' },
+                    cwd: { type: 'string', description: 'Project directory to explore' },
+                    model: { type: 'string', description: 'Model to use (default: opus)' },
+                    timeout: { type: 'number', description: 'Timeout in ms (default: 1800000 = 30 min)' },
+                },
+                required: ['task'],
+            },
+            execute: async (_id, args) => {
+                const result = getManager().ultraplanStart(args.task, {
+                    cwd: sanitizeCwd(args.cwd),
+                    model: args.model,
+                    timeout: args.timeout,
+                });
+                return { ok: true, ...result, note: 'Ultraplan running in background. Poll with ultraplan_status.' };
+            },
+        });
+        // ─── Tool: ultraplan_status ─────────────────────────────────────
+        api.registerTool({
+            name: 'ultraplan_status',
+            description: 'Get the status of an Ultraplan session. Returns the plan text when completed.',
+            parameters: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Ultraplan ID' } },
+                required: ['id'],
+            },
+            execute: async (_id, args) => {
+                const result = getManager().ultraplanStatus(args.id);
+                if (!result)
+                    return { ok: false, error: 'Ultraplan not found' };
+                return { ok: true, ...result };
+            },
+        });
+        // ─── Tool: ultrareview_start ────────────────────────────────────
+        api.registerTool({
+            name: 'ultrareview_start',
+            description: 'Start an Ultrareview: a fleet of bug-hunting agents (5-20) that review your codebase from different angles in parallel. Each agent specializes in a different area (security, performance, logic, types, etc.). Runs in background.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    cwd: { type: 'string', description: 'Project directory to review' },
+                    agentCount: { type: 'number', description: 'Number of reviewer agents (1-20, default 5)' },
+                    maxDurationMinutes: { type: 'number', description: 'Max review duration in minutes (5-25, default 10)' },
+                    model: { type: 'string', description: 'Model for reviewers (default: session default)' },
+                    focus: { type: 'string', description: 'Review focus area (default: bugs + security + quality)' },
+                },
+                required: ['cwd'],
+            },
+            execute: async (_id, args) => {
+                const result = getManager().ultrareviewStart(sanitizeCwd(args.cwd), {
+                    agentCount: args.agentCount,
+                    maxDurationMinutes: args.maxDurationMinutes,
+                    model: args.model,
+                    focus: args.focus,
+                });
+                return { ok: true, ...result, note: 'Ultrareview running in background. Poll with ultrareview_status.' };
+            },
+        });
+        // ─── Tool: ultrareview_status ───────────────────────────────────
+        api.registerTool({
+            name: 'ultrareview_status',
+            description: 'Get the status of an Ultrareview. Returns all findings when completed.',
+            parameters: {
+                type: 'object',
+                properties: { id: { type: 'string', description: 'Ultrareview ID' } },
+                required: ['id'],
+            },
+            execute: async (_id, args) => {
+                const result = getManager().ultrareviewStatus(args.id);
+                if (!result)
+                    return { ok: false, error: 'Ultrareview not found' };
+                return { ok: true, ...result };
+            },
+        });
+    },
+};
+export default plugin;
+//# sourceMappingURL=index.js.map
