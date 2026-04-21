@@ -124,13 +124,11 @@ export class EmbeddedServer {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // CORS — localhost by default; /v1/ paths allow all origins (for webchat frontends)
+    // CORS — localhost only by default
     const origin = req.headers.origin || '';
-    const urlPath = new URL(req.url || '/', `http://localhost:${this.port}`).pathname;
     const corsAllowAll = process.env.OPENCLAW_CORS_ORIGINS === '*';
-    // SECURITY FIX: removed isV1Path — /v1/ paths no longer get blanket CORS.
-    // Without this, any website could make cross-origin requests to the local
-    // server, bypassing the localhost-only security boundary.
+    // SECURITY FIX: /v1/ paths no longer get blanket CORS.
+    // Only localhost origins or explicit OPENCLAW_CORS_ORIGINS=* are allowed.
     const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$/.test(origin);
     if (isLocalhost || corsAllowAll) {
       res.setHeader('Access-Control-Allow-Origin', origin || '*');
