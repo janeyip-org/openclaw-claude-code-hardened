@@ -267,8 +267,22 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       XDG_DATA_HOME: process.env.XDG_DATA_HOME,
       // Claude-specific
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
       CLAUDE_CODE_USE_BEDROCK: process.env.CLAUDE_CODE_USE_BEDROCK,
       CLAUDE_CODE_USE_VERTEX: process.env.CLAUDE_CODE_USE_VERTEX,
+      // Git over SSH
+      SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND,
+      // Proxy
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      NO_PROXY: process.env.NO_PROXY,
+      // AWS (for Bedrock)
+      AWS_REGION: process.env.AWS_REGION,
+      AWS_DEFAULT_REGION: process.env.AWS_DEFAULT_REGION,
+      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN,
       // Node
       NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE,
       NODE_ENV: process.env.NODE_ENV,

@@ -8,6 +8,7 @@
  */
 
 import * as http from 'node:http';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -123,13 +124,11 @@ export class EmbeddedServer {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // CORS — localhost by default; /v1/ paths allow all origins (for webchat frontends)
+    // CORS — localhost only by default
     const origin = req.headers.origin || '';
-    const urlPath = new URL(req.url || '/', `http://localhost:${this.port}`).pathname;
     const corsAllowAll = process.env.OPENCLAW_CORS_ORIGINS === '*';
-    // SECURITY FIX: removed isV1Path — /v1/ paths no longer get blanket CORS.
-    // Without this, any website could make cross-origin requests to the local
-    // server, bypassing the localhost-only security boundary.
+    // SECURITY FIX: /v1/ paths no longer get blanket CORS.
+    // Only localhost origins or explicit OPENCLAW_CORS_ORIGINS=* are allowed.
     const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$/.test(origin);
     if (isLocalhost || corsAllowAll) {
       res.setHeader('Access-Control-Allow-Origin', origin || '*');
@@ -150,7 +149,7 @@ export class EmbeddedServer {
       const authHeader = req.headers.authorization || '';
       const expected = Buffer.from(`Bearer ${this.authToken}`);
       const received = Buffer.from(authHeader);
-      if (expected.length !== received.length || !require('node:crypto').timingSafeEqual(expected, received)) {
+      if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'Unauthorized — provide Authorization: Bearer <token>' }));
         return;
