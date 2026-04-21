@@ -1,0 +1,1351 @@
+/**
+ * SessionManager — manages multiple PersistentClaudeSession instances
+ *
+ * Replaces the Express server layer. Pure class with no HTTP dependency.
+ * Can be used by Plugin tools, CLI, or any other consumer.
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
+import * as http from 'node:http';
+import { createRequire } from 'node:module';
+const _require = createRequire(import.meta.url);
+function getPluginVersion() {
+    try {
+        // Walk up from this file to find package.json
+        let dir = path.dirname(_require.resolve('./session-manager.js').replace('/dist/', '/'));
+        for (let i = 0; i < 5; i++) {
+            const pkgPath = path.join(dir, 'package.json');
+            if (fs.existsSync(pkgPath)) {
+                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+                if (pkg.version)
+                    return pkg.version;
+            }
+            dir = path.dirname(dir);
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return 'unknown';
+}
+// ─── Persistence ─────────────────────────────────────────────────────────────
+const PERSIST_DIR = path.join(os.homedir(), '.openclaw');
+const PERSIST_FILE = path.join(PERSIST_DIR, 'claude-sessions.json');
+function loadPersistedSessions() {
+    try {
+        if (!fs.existsSync(PERSIST_FILE))
+            return new Map();
+        const raw = fs.readFileSync(PERSIST_FILE, 'utf8');
+        const arr = JSON.parse(raw);
+        const now = Date.now();
+        // Filter out entries older than disk TTL
+        const valid = arr.filter((s) => now - s.lastActivity < PERSIST_DISK_TTL_MS);
+        return new Map(valid.map((s) => [s.name, s]));
+    }
+    catch {
+        return new Map();
+    }
+}
+// Atomic write: write to .tmp then rename to avoid corrupt reads on crash
+function savePersistedSessions(sessions, logger) {
+    try {
+        fs.mkdirSync(PERSIST_DIR, { recursive: true });
+        const arr = Array.from(sessions.values());
+        const tmp = PERSIST_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
+        fs.renameSync(tmp, PERSIST_FILE);
+    }
+    catch (err) {
+        (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', err.message);
+    }
+}
+// Async version for hot-path (sendMessage, TTL cleanup)
+function savePersistedSessionsAsync(sessions, logger) {
+    const log = logger || createConsoleLogger('SessionManager');
+    const arr = Array.from(sessions.values());
+    const tmp = PERSIST_FILE + '.tmp';
+    fs.mkdir(PERSIST_DIR, { recursive: true }, (mkdirErr) => {
+        if (mkdirErr) {
+            log.error('Failed to create persist dir:', mkdirErr.message);
+            return;
+        }
+        fs.writeFile(tmp, JSON.stringify(arr, null, 2), (writeErr) => {
+            if (writeErr) {
+                log.error('Failed to write session file:', writeErr.message);
+                return;
+            }
+            fs.rename(tmp, PERSIST_FILE, (renameErr) => {
+                if (renameErr) {
+                    log.error('Failed to rename session file:', renameErr.message);
+                    // Clean up orphan tmp file
+                    fs.unlink(tmp, () => { });
+                }
+            });
+        });
+    });
+}
+// Debounce helper — coalesces rapid writes into one
+function makeDebounced(fn, ms) {
+    let timer = null;
+    return () => {
+        if (timer)
+            clearTimeout(timer);
+        timer = setTimeout(() => {
+            timer = null;
+            fn();
+        }, ms);
+    };
+}
+import { createConsoleLogger } from './logger.js';
+import { CircuitBreaker } from './circuit-breaker.js';
+import { InboxManager } from './inbox-manager.js';
+import { sanitizeCwd, validateName } from './validation.js';
+import { PersistentClaudeSession } from './persistent-session.js';
+import { PersistentGeminiSession } from './persistent-gemini-session.js';
+import { PersistentCodexSession } from './persistent-codex-session.js';
+import { PersistentCursorSession } from './persistent-cursor-session.js';
+import { PersistentCustomSession } from './persistent-custom-session.js';
+import { overrideModelPricing, } from './types.js';
+import { resolveAlias, isClaudeModel } from './models.js';
+import { Council } from './council.js';
+import { PERSIST_DISK_TTL_MS, DEBOUNCED_SAVE_MS, CLEANUP_INTERVAL_MS, TURN_TIMEOUT_MS, GREP_HISTORY_FETCH, TEAM_LIST_TIMEOUT_MS, TEAM_SEND_TIMEOUT_MS, RESULT_TTL_MS, ULTRAPLAN_TIMEOUT_MS, ULTRAREVIEW_POLL_INTERVAL_MS, STOP_SIGKILL_DELAY_MS, SESSION_EVENT, DEFAULT_HISTORY_LIMIT, } from './constants.js';
+// ─── SessionManager ──────────────────────────────────────────────────────────
+export class SessionManager {
+    sessions = new Map();
+    _pendingSessions = new Map();
+    cleanupTimer = null;
+    pluginConfig;
+    persistedSessions;
+    _debouncedSave;
+    _proxyServer = null;
+    _proxyPort = null;
+    _activePids = new Map();
+    _circuitBreaker = new CircuitBreaker();
+    _inbox = new InboxManager();
+    logger;
+    constructor(config, logger) {
+        this.logger = logger || createConsoleLogger('SessionManager');
+        this.pluginConfig = {
+            claudeBin: config?.claudeBin || 'claude',
+            defaultModel: config?.defaultModel,
+            defaultPermissionMode: config?.defaultPermissionMode || 'acceptEdits',
+            defaultEffort: config?.defaultEffort || 'auto',
+            maxConcurrentSessions: config?.maxConcurrentSessions || 5,
+            sessionTtlMinutes: config?.sessionTtlMinutes || 120,
+        };
+        // Apply pricing overrides if provided
+        if (config?.pricingOverrides) {
+            overrideModelPricing(config.pricingOverrides);
+        }
+        // Load persisted session registry from disk
+        this.persistedSessions = loadPersistedSessions();
+        // Clean up orphaned child processes from a previous unclean exit
+        this._cleanupOrphanedPids();
+        // Debounced async writer — at most one write per 5 seconds on hot paths
+        this._debouncedSave = makeDebounced(() => savePersistedSessionsAsync(this.persistedSessions, this.logger), DEBOUNCED_SAVE_MS);
+        // Start TTL cleanup timer
+        this.cleanupTimer = setInterval(() => this._cleanupIdleSessions(), CLEANUP_INTERVAL_MS);
+    }
+    // ─── Session Lifecycle ─────────────────────────────────────────────────
+    async startSession(config) {
+        const name = config.name || `session-${Date.now()}`;
+        // Check pending first — a concurrent caller may have already started creation
+        const pending = this._pendingSessions.get(name);
+        if (pending)
+            return pending;
+        if (this.sessions.has(name)) {
+            const existing = this.sessions.get(name);
+            return this._toSessionInfo(name, existing);
+        }
+        // Create the promise and register it in _pendingSessions BEFORE any async work,
+        // so concurrent callers arriving between now and completion see the pending entry.
+        const promise = this._doStartSession(name, config);
+        this._pendingSessions.set(name, promise);
+        try {
+            return await promise;
+        }
+        finally {
+            this._pendingSessions.delete(name);
+        }
+    }
+    async _doStartSession(name, config) {
+        if (this.sessions.size >= this.pluginConfig.maxConcurrentSessions) {
+            throw new Error(`Max concurrent sessions (${this.pluginConfig.maxConcurrentSessions}) reached`);
+        }
+        // Auto-resume: if we have a persisted claudeSessionId for this name, inject it.
+        // Skip when config.skipPersistence is set (e.g. openai-compat bridge sessions
+        // that must NOT resume stale CLI state from a previous server run).
+        const skipPersist = !!config.skipPersistence;
+        const persisted = skipPersist ? undefined : this.persistedSessions.get(name);
+        // Unified: only use resumeSessionId (claudeResumeId is an internal alias, not exposed)
+        const resumeId = config.resumeSessionId ?? persisted?.claudeSessionId;
+        const fullConfig = {
+            name,
+            cwd: config.cwd || persisted?.cwd || process.cwd(),
+            permissionMode: config.permissionMode || this.pluginConfig.defaultPermissionMode,
+            effort: config.effort || this.pluginConfig.defaultEffort,
+            model: config.model || persisted?.model || this.pluginConfig.defaultModel,
+            ...config,
+            ...(resumeId ? { resumeSessionId: resumeId } : {}),
+        };
+        // Resolve model alias
+        if (fullConfig.model) {
+            fullConfig.resolvedModel = this._resolveModel(fullConfig.model, fullConfig.modelOverrides);
+        }
+        // Auto-inject proxy baseUrl for non-Claude models on the claude engine.
+        // Starts a local proxy server that converts Anthropic → OpenAI format
+        // and forwards to the OpenClaw gateway. Zero config required.
+        const engine = fullConfig.engine || persisted?.engine || 'claude';
+        // Circuit breaker — reject early if engine is in backoff
+        this._circuitBreaker.check(engine);
+        if (engine === 'claude' && fullConfig.resolvedModel && !fullConfig.baseUrl) {
+            if (!isClaudeModel(fullConfig.resolvedModel)) {
+                const proxyPort = await this._ensureProxyServer();
+                if (proxyPort) {
+                    fullConfig.baseUrl = `http://127.0.0.1:${proxyPort}`;
+                }
+            }
+        }
+        const session = this._createSession(engine, fullConfig);
+        session.on(SESSION_EVENT.LOG, (...args) => this.logger.info(`[Session:${name}]`, ...args));
+        try {
+            await session.start();
+        }
+        catch (err) {
+            this._circuitBreaker.recordFailure(engine);
+            throw err;
+        }
+        // Engine started successfully — reset circuit breaker
+        this._circuitBreaker.reset(engine);
+        // Track child process PID for orphan cleanup
+        if (session.pid) {
+            this._activePids.set(name, session.pid);
+            this._savePids();
+        }
+        const managed = {
+            session,
+            config: fullConfig,
+            created: persisted?.originalCreated || new Date().toISOString(),
+            lastActivity: Date.now(),
+            cwd: fullConfig.cwd,
+            claudeSessionId: session.sessionId,
+        };
+        this.sessions.set(name, managed);
+        // Persist registry after session is live (skip for ephemeral sessions
+        // like the openai-compat bridge that set skipPersistence: true)
+        if (!skipPersist) {
+            this._persistSession(name, managed);
+        }
+        return this._toSessionInfo(name, managed);
+    }
+    async sendMessage(name, message, options = {}) {
+        const managed = this._getSession(name);
+        // Per-session serialization. Two concurrent sendMessage() calls on the
+        // same session previously raced on PersistentClaudeSession._streamCallbacks
+        // and the shared TURN_COMPLETE listener — the second caller would receive
+        // the first caller's response, and stream callbacks would clobber each
+        // other. Chain waiters via a per-session promise so a slow turn blocks
+        // (rather than corrupts) subsequent sends.
+        const prior = managed.sendChain ?? Promise.resolve();
+        let releaseChain;
+        const link = new Promise((resolve) => {
+            releaseChain = resolve;
+        });
+        managed.sendChain = prior.then(() => link).catch(() => link);
+        try {
+            await prior;
+        }
+        catch {
+            /* prior failure shouldn't block this caller */
+        }
+        try {
+            managed.lastActivity = Date.now();
+            const sendOpts = {
+                waitForComplete: true,
+                timeout: options.timeout || TURN_TIMEOUT_MS,
+            };
+            if (options.effort)
+                sendOpts.effort = options.effort;
+            if (options.plan)
+                sendOpts.plan = true;
+            if (options.onEvent || options.onChunk) {
+                sendOpts.callbacks = {
+                    onText: (text) => {
+                        if (options.onChunk)
+                            options.onChunk(text);
+                        if (options.onEvent)
+                            options.onEvent({ type: 'text', result: text });
+                    },
+                    onToolUse: (event) => {
+                        if (options.onEvent)
+                            options.onEvent({ type: 'tool_use', ...event });
+                    },
+                    onToolResult: (event) => {
+                        if (options.onEvent)
+                            options.onEvent({ type: 'tool_result', ...event });
+                    },
+                };
+            }
+            const result = await managed.session.send(message, sendOpts);
+            // Update session ID if available (skip disk persist for ephemeral
+            // sessions that were started with skipPersistence)
+            if (managed.session.sessionId) {
+                managed.claudeSessionId = managed.session.sessionId;
+                if (this.persistedSessions.has(name)) {
+                    this._persistSession(name, managed);
+                }
+            }
+            if ('text' in result) {
+                return {
+                    output: result.text,
+                    sessionId: managed.claudeSessionId,
+                    events: [],
+                };
+            }
+            return { output: '', sessionId: managed.claudeSessionId, events: [] };
+        }
+        finally {
+            releaseChain();
+            // If this was the tail of the chain, clear it so memory doesn't grow.
+            if (managed.sendChain === link)
+                managed.sendChain = undefined;
+        }
+    }
+    async stopSession(name) {
+        const managed = this._getSession(name);
+        managed.session.stop();
+        this.sessions.delete(name);
+        // Remove PID tracking
+        this._activePids.delete(name);
+        this._savePids();
+        // Explicit stop = user intent to end session — remove from disk too
+        this.persistedSessions.delete(name);
+        savePersistedSessions(this.persistedSessions, this.logger);
+    }
+    listSessions() {
+        return Array.from(this.sessions.entries()).map(([name, managed]) => this._toSessionInfo(name, managed));
+    }
+    listPersistedSessions() {
+        return Array.from(this.persistedSessions.values());
+    }
+    getStatus(name) {
+        const managed = this._getSession(name);
+        return {
+            ...this._toSessionInfo(name, managed),
+            stats: managed.session.getStats(),
+        };
+    }
+    // ─── Session Operations ────────────────────────────────────────────────
+    async grepSession(name, pattern, limit = DEFAULT_HISTORY_LIMIT) {
+        const managed = this._getSession(name);
+        const history = managed.session.getHistory(GREP_HISTORY_FETCH);
+        const regex = new RegExp(pattern, 'i');
+        return history
+            .filter((ev) => regex.test(JSON.stringify(ev)))
+            .slice(0, limit)
+            .map((ev) => ({
+            time: ev.time,
+            type: ev.type,
+            content: JSON.stringify(ev.event),
+        }));
+    }
+    async compactSession(name, summary) {
+        const managed = this._getSession(name);
+        await managed.session.compact(summary);
+    }
+    setEffort(name, level) {
+        const managed = this._getSession(name);
+        managed.session.setEffort(level);
+        managed.config.effort = level;
+    }
+    /**
+     * Switch model for a session.
+     * Updates in-memory config only (takes effect on next restart/resume).
+     * For immediate effect, call restartWithConfig() explicitly.
+     */
+    setModel(name, model) {
+        const managed = this._getSession(name);
+        const resolved = this._resolveModel(model, managed.config.modelOverrides);
+        managed.config.model = model;
+        managed.config.resolvedModel = resolved;
+    }
+    /**
+     * Switch model immediately by restarting the session with --resume.
+     * Conversation history is preserved via the claude session ID.
+     *
+     * Guards:
+     * - Rejects if session is currently processing a message (busy guard)
+     * - Validates model string against known aliases before restarting
+     * - Rolls back to old session if startSession fails
+     */
+    async switchModel(name, model) {
+        const managed = this._getSession(name);
+        // Busy guard — don't restart mid-message
+        if (managed.session.isBusy) {
+            throw new Error(`Session '${name}' is currently processing a message. Wait for it to finish before switching model.`);
+        }
+        const sessionId = managed.claudeSessionId || managed.session.sessionId;
+        if (!sessionId)
+            throw new Error(`Session '${name}' has no claude session ID — cannot resume after restart`);
+        // Validate model — must be a known alias or contain a recognisable pattern
+        const resolvedModel = this._resolveModel(model, managed.config.modelOverrides);
+        const knownPatterns = ['claude-', 'gemini-', 'gpt-', 'anthropic/', 'google/', 'openai/'];
+        const looksValid = knownPatterns.some((p) => resolvedModel.includes(p));
+        if (!looksValid) {
+            throw new Error(`Unknown model '${model}' (resolved: '${resolvedModel}'). Use a known alias (opus, sonnet, haiku, gemini-pro, etc.) or a full provider/model string.`);
+        }
+        const oldConfig = { ...managed.config };
+        managed.session.stop();
+        this.sessions.delete(name);
+        try {
+            return await this.startSession({
+                ...oldConfig,
+                name,
+                model,
+                resumeSessionId: sessionId,
+            });
+        }
+        catch (err) {
+            // Rollback: restart with original config
+            this.logger.error(`switchModel failed for '${name}', attempting rollback:`, err);
+            try {
+                await this.startSession({ ...oldConfig, name, resumeSessionId: sessionId });
+            }
+            catch (rollbackErr) {
+                this.logger.error(`Rollback also failed for '${name}':`, rollbackErr);
+            }
+            throw new Error(`Failed to switch model for '${name}': ${err.message}`);
+        }
+    }
+    /**
+     * Update allowedTools or disallowedTools at runtime.
+     *
+     * The claude CLI does not support changing tool lists while running, so
+     * the only way to apply new constraints is to restart the process with
+     * the updated flags and --resume to replay conversation history.
+     *
+     * Guards:
+     * - Rejects if session is busy
+     * - Rolls back to old session if startSession fails
+     * - merge:true adds tools; removeTools removes specific tools from the list
+     */
+    async updateTools(name, opts) {
+        const managed = this._getSession(name);
+        // Busy guard
+        if (managed.session.isBusy) {
+            throw new Error(`Session '${name}' is currently processing a message. Wait for it to finish before updating tools.`);
+        }
+        const sessionId = managed.claudeSessionId || managed.session.sessionId;
+        if (!sessionId)
+            throw new Error(`Session '${name}' has no claude session ID — cannot resume after restart`);
+        const oldConfig = { ...managed.config };
+        let newAllowed = opts.allowedTools;
+        let newDisallowed = opts.disallowedTools;
+        if (opts.merge) {
+            newAllowed = opts.allowedTools
+                ? [...new Set([...(oldConfig.allowedTools || []), ...opts.allowedTools])]
+                : oldConfig.allowedTools;
+            newDisallowed = opts.disallowedTools
+                ? [...new Set([...(oldConfig.disallowedTools || []), ...opts.disallowedTools])]
+                : oldConfig.disallowedTools;
+        }
+        // Remove specific tools if requested
+        if (opts.removeTools?.length) {
+            const removeSet = new Set(opts.removeTools);
+            if (newAllowed)
+                newAllowed = newAllowed.filter((t) => !removeSet.has(t));
+            if (newDisallowed)
+                newDisallowed = newDisallowed.filter((t) => !removeSet.has(t));
+        }
+        managed.session.stop();
+        this.sessions.delete(name);
+        try {
+            return await this.startSession({
+                ...oldConfig,
+                name,
+                allowedTools: newAllowed,
+                disallowedTools: newDisallowed,
+                resumeSessionId: sessionId,
+            });
+        }
+        catch (err) {
+            this.logger.error(`updateTools failed for '${name}', attempting rollback:`, err);
+            try {
+                await this.startSession({ ...oldConfig, name, resumeSessionId: sessionId });
+            }
+            catch (rollbackErr) {
+                this.logger.error(`Rollback also failed for '${name}':`, rollbackErr);
+            }
+            throw new Error(`Failed to update tools for '${name}': ${err.message}`);
+        }
+    }
+    getCost(name) {
+        const managed = this._getSession(name);
+        return managed.session.getCost();
+    }
+    // ─── Agent/Skill/Rule Management ──────────────────────────────────────
+    listAgents(cwd) {
+        const safeCwd = sanitizeCwd(cwd);
+        const projectDir = path.join(safeCwd || os.homedir(), '.claude', 'agents');
+        const globalDir = path.join(os.homedir(), '.claude', 'agents');
+        const project = this._listMdFiles(projectDir);
+        const global = this._listMdFiles(globalDir);
+        const seen = new Set(project.map((a) => a.name));
+        return [...project, ...global.filter((a) => !seen.has(a.name))];
+    }
+    createAgent(name, cwd, description, prompt) {
+        validateName(name);
+        const safeCwd = sanitizeCwd(cwd);
+        const dir = path.join(safeCwd || os.homedir(), '.claude', 'agents');
+        fs.mkdirSync(dir, { recursive: true });
+        const filePath = path.join(dir, `${name}.md`);
+        const content = `---\ndescription: ${description || name}\n---\n\n${prompt || `You are ${name}.`}\n`;
+        fs.writeFileSync(filePath, content);
+        return filePath;
+    }
+    listSkills(cwd) {
+        const safeCwd = sanitizeCwd(cwd);
+        const dirs = [
+            path.join(safeCwd || os.homedir(), '.claude', 'skills'),
+            path.join(os.homedir(), '.claude', 'skills'),
+        ];
+        const all = [];
+        const seen = new Set();
+        for (const dir of dirs) {
+            if (!fs.existsSync(dir))
+                continue;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (!entry.isDirectory() || seen.has(entry.name))
+                    continue;
+                seen.add(entry.name);
+                const skillMd = path.join(dir, entry.name, 'SKILL.md');
+                let description = '';
+                if (fs.existsSync(skillMd)) {
+                    const content = fs.readFileSync(skillMd, 'utf8');
+                    const match = content.match(/^---\n[\s\S]*?description:\s*(.+)/m);
+                    if (match)
+                        description = match[1].trim();
+                }
+                all.push({ name: entry.name, hasSkillMd: fs.existsSync(skillMd), description });
+            }
+        }
+        return all;
+    }
+    createSkill(name, cwd, opts) {
+        validateName(name);
+        const safeCwd = sanitizeCwd(cwd);
+        const dir = path.join(safeCwd || os.homedir(), '.claude', 'skills', name);
+        fs.mkdirSync(dir, { recursive: true });
+        const filePath = path.join(dir, 'SKILL.md');
+        let content = '---\n';
+        if (opts?.description)
+            content += `description: ${opts.description}\n`;
+        if (opts?.trigger)
+            content += `trigger: ${opts.trigger}\n`;
+        content += `---\n\n${opts?.prompt || `# ${name}\n\nSkill instructions here.\n`}\n`;
+        fs.writeFileSync(filePath, content);
+        return filePath;
+    }
+    listRules(cwd) {
+        const safeCwd = sanitizeCwd(cwd);
+        const dirs = [path.join(safeCwd || os.homedir(), '.claude', 'rules'), path.join(os.homedir(), '.claude', 'rules')];
+        const all = [];
+        const seen = new Set();
+        for (const dir of dirs) {
+            if (!fs.existsSync(dir))
+                continue;
+            for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.md'))) {
+                const name = f.replace('.md', '');
+                if (seen.has(name))
+                    continue;
+                seen.add(name);
+                const content = fs.readFileSync(path.join(dir, f), 'utf8');
+                const descMatch = content.match(/^---\n[\s\S]*?description:\s*(.+)/m);
+                const pathsMatch = content.match(/^---\n[\s\S]*?paths:\s*(.+)/m);
+                const ifMatch = content.match(/^---\n[\s\S]*?if:\s*(.+)/m);
+                all.push({
+                    name,
+                    file: f,
+                    description: descMatch?.[1]?.trim() || '',
+                    paths: pathsMatch?.[1]?.trim() || '',
+                    condition: ifMatch?.[1]?.trim() || '',
+                });
+            }
+        }
+        return all;
+    }
+    createRule(name, cwd, opts) {
+        validateName(name);
+        const safeCwd = sanitizeCwd(cwd);
+        const dir = path.join(safeCwd || os.homedir(), '.claude', 'rules');
+        fs.mkdirSync(dir, { recursive: true });
+        const filePath = path.join(dir, `${name}.md`);
+        let fileContent = '---\n';
+        if (opts?.description)
+            fileContent += `description: ${opts.description}\n`;
+        if (opts?.paths)
+            fileContent += `paths: ${opts.paths}\n`;
+        if (opts?.condition)
+            fileContent += `if: ${opts.condition}\n`;
+        fileContent += `---\n\n${opts?.content || `# ${name}\n\nRule instructions here.\n`}\n`;
+        fs.writeFileSync(filePath, fileContent);
+        return filePath;
+    }
+    // ─── Agent Teams ───────────────────────────────────────────────────────
+    async teamList(name) {
+        const managed = this._getSession(name);
+        const engine = managed.config.engine || 'claude';
+        // Claude: use native /team command
+        if (engine === 'claude') {
+            const result = await managed.session.send('/team', { waitForComplete: true, timeout: TEAM_LIST_TIMEOUT_MS });
+            return 'text' in result ? result.text : '';
+        }
+        // Codex/Gemini: list other active sessions as virtual teammates
+        const teammates = [];
+        for (const [sessionName, m] of this.sessions) {
+            if (sessionName === name)
+                continue;
+            const eng = m.config.engine || 'claude';
+            const stats = m.session.getStats();
+            const status = m.session.isBusy ? 'busy' : m.session.isPaused ? 'paused' : 'idle';
+            teammates.push(`- ${sessionName} (${eng}, ${status}, ${stats.turns} turns)`);
+        }
+        return teammates.length > 0
+            ? `Virtual team (${teammates.length} sessions):\n${teammates.join('\n')}`
+            : 'No other active sessions';
+    }
+    async teamSend(name, teammate, message) {
+        const managed = this._getSession(name);
+        const engine = managed.config.engine || 'claude';
+        // Claude: use native @teammate command
+        if (engine === 'claude') {
+            managed.lastActivity = Date.now();
+            const result = await managed.session.send(`@${teammate} ${message}`, {
+                waitForComplete: true,
+                timeout: TEAM_SEND_TIMEOUT_MS,
+            });
+            return {
+                output: 'text' in result ? result.text : '',
+                sessionId: managed.claudeSessionId,
+                events: [],
+            };
+        }
+        // Codex/Gemini: route via cross-session messaging
+        if (!this.sessions.has(teammate)) {
+            throw new Error(`Target session '${teammate}' not found. Use team_list to see available sessions.`);
+        }
+        const deliveryResult = await this.sessionSendTo(name, teammate, message, `team message from ${name}`);
+        return {
+            output: deliveryResult.delivered
+                ? `Message delivered to ${teammate}`
+                : `Message queued for ${teammate} (session is busy)`,
+            sessionId: managed.claudeSessionId,
+            events: [],
+        };
+    }
+    // ─── Health ────────────────────────────────────────────────────────────
+    /**
+     * Returns an overview of all active sessions — analogous to a dashboard.
+     * Unlike claude_session_status (single session), this gives the aggregate
+     * view: how many sessions are running, which are busy, total uptime, etc.
+     */
+    health() {
+        const details = Array.from(this.sessions.entries()).map(([name, managed]) => {
+            const stats = managed.session.getStats();
+            return {
+                name,
+                ready: stats.isReady,
+                busy: managed.session.isBusy,
+                paused: managed.session.isPaused,
+                turns: stats.turns,
+                costUsd: stats.costUsd,
+                contextPercent: stats.contextPercent,
+                lastActivity: stats.lastActivity,
+            };
+        });
+        return {
+            ok: true,
+            version: getPluginVersion(),
+            sessions: this.sessions.size,
+            sessionNames: Array.from(this.sessions.keys()),
+            uptime: process.uptime(),
+            details,
+            circuitBreakers: this._circuitBreaker.getStatus(),
+        };
+    }
+    /** Return plugin version from package.json */
+    getVersion() {
+        return getPluginVersion();
+    }
+    // ─── Shutdown ──────────────────────────────────────────────────────────
+    /**
+     * Gracefully shut down the session manager.
+     *
+     * 1. Cancels the periodic TTL cleanup timer
+     * 2. Stops all ultrareview polling intervals
+     * 3. Sends SIGTERM to all active session child processes
+     * 4. Persists final session registry to disk
+     *
+     * After shutdown(), no new sessions can be started. Idempotent.
+     */
+    async shutdown() {
+        if (this.cleanupTimer) {
+            clearInterval(this.cleanupTimer);
+            this.cleanupTimer = null;
+        }
+        // Stop ultrareview pollers
+        for (const [, timer] of this.ultrareviewPollers)
+            clearInterval(timer);
+        this.ultrareviewPollers.clear();
+        // Stop all sessions
+        for (const [name, managed] of this.sessions) {
+            try {
+                managed.session.stop();
+            }
+            catch {
+                // Best-effort — session may already be dead; must not block cleanup
+            }
+            this.logger.info(`Stopped session: ${name}`);
+        }
+        this.sessions.clear();
+        // Clear PID tracking
+        this._activePids.clear();
+        this._savePids();
+        // Stop proxy server
+        if (this._proxyServer) {
+            this._proxyServer.close();
+            this._proxyServer = null;
+            this._proxyPort = null;
+        }
+        // Persist final state (TTL-expired sessions already removed by cleanup)
+        savePersistedSessions(this.persistedSessions, this.logger);
+    }
+    // ─── Auto Proxy ───────────────────────────────────────────────────────
+    /**
+     * Read OpenClaw gateway config from ~/.openclaw/openclaw.json.
+     * Returns { url, key } or null if not configured.
+     */
+    _readGatewayConfig() {
+        try {
+            const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+            if (!fs.existsSync(configPath))
+                return null;
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            const gw = config.gateway;
+            if (!gw)
+                return null;
+            const port = gw.port || 18789;
+            const auth = gw.auth;
+            // Support both password and token auth modes
+            const key = auth?.password || auth?.token || '';
+            return { url: `http://127.0.0.1:${port}/v1`, key };
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Start a local proxy server (if not running) that converts Anthropic format
+     * to OpenAI format and forwards to the OpenClaw gateway.
+     * Returns the proxy port, or null if gateway is not available.
+     */
+    async _ensureProxyServer() {
+        if (this._proxyPort)
+            return this._proxyPort;
+        // Auto-detect gateway config
+        const gwConfig = this._readGatewayConfig();
+        const gatewayUrl = process.env.GATEWAY_URL || gwConfig?.url;
+        const gatewayKey = process.env.GATEWAY_KEY || gwConfig?.key;
+        if (!gatewayUrl) {
+            this.logger.info('No OpenClaw gateway found — proxy not available');
+            return null;
+        }
+        // Lazy import to avoid circular deps
+        const { createProxyHandler } = await import('./proxy/handler.js');
+        const proxyHandler = createProxyHandler(undefined, {
+            anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+            openaiApiKey: process.env.OPENAI_API_KEY,
+            geminiApiKey: process.env.GEMINI_API_KEY,
+            gatewayUrl,
+            gatewayKey,
+        });
+        return new Promise((resolve) => {
+            const server = http.createServer((req, res) => {
+                let body = '';
+                req.on('data', (chunk) => {
+                    body += chunk.toString();
+                });
+                req.on('end', () => {
+                    const httpReq = {
+                        method: req.method || 'GET',
+                        url: req.url || '/',
+                        headers: req.headers,
+                        json: async () => JSON.parse(body),
+                    };
+                    const httpRes = {
+                        status: (code) => {
+                            res.statusCode = code;
+                            return httpRes;
+                        },
+                        json: (data) => {
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify(data));
+                        },
+                        setHeader: (k, v) => res.setHeader(k, v),
+                        write: (data) => res.write(data),
+                        end: () => res.end(),
+                        flushHeaders: () => res.flushHeaders(),
+                    };
+                    proxyHandler(httpReq, httpRes).catch((err) => {
+                        res.statusCode = 500;
+                        res.end(JSON.stringify({ error: err.message }));
+                    });
+                });
+            });
+            server.listen(0, '127.0.0.1', () => {
+                const addr = server.address();
+                this._proxyServer = server;
+                this._proxyPort = addr.port;
+                this.logger.info(`Auto-proxy started on port ${addr.port} (gateway: ${gatewayUrl})`);
+                resolve(addr.port);
+            });
+            server.on('error', (err) => {
+                this.logger.error('Failed to start proxy server:', err.message);
+                resolve(null);
+            });
+        });
+    }
+    // ─── Private ───────────────────────────────────────────────────────────
+    _persistSession(name, managed) {
+        if (!managed.claudeSessionId)
+            return;
+        const existing = this.persistedSessions.get(name);
+        this.persistedSessions.set(name, {
+            name,
+            claudeSessionId: managed.claudeSessionId,
+            cwd: managed.cwd,
+            model: managed.config.resolvedModel || managed.config.model,
+            engine: managed.config.engine,
+            originalCreated: existing?.originalCreated || managed.created,
+            lastResumed: new Date().toISOString(),
+            lastActivity: managed.lastActivity,
+        });
+        this._debouncedSave();
+    }
+    // ─── PID Tracking ──────────────────────────────────────────────────────
+    static PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
+    _savePids() {
+        try {
+            const dir = path.dirname(SessionManager.PID_FILE);
+            if (!fs.existsSync(dir))
+                fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(SessionManager.PID_FILE, JSON.stringify(Object.fromEntries(this._activePids)));
+        }
+        catch {
+            /* best effort */
+        }
+    }
+    /**
+     * Verify that a PID belongs to a known coding CLI before killing it.
+     * Prevents killing unrelated processes if the OS recycled the PID.
+     */
+    _isKnownCliProcess(pid) {
+        // Match known CLI binaries by basename to avoid false positives
+        // (e.g., 'agent' must not match 'ssh-agent' or 'gpg-agent')
+        const knownPatterns = [
+            /\bclaude\b/, // claude CLI
+            /\bcodex\b/, // codex CLI
+            /\bgemini\b/, // gemini CLI
+            /\bcursor-agent\b/, // cursor-agent CLI
+            /(?:^|\/)agent\s/, // 'agent' as standalone command (not ssh-agent etc.)
+        ];
+        try {
+            const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+                encoding: 'utf8',
+                timeout: 3_000,
+            }).trim();
+            return knownPatterns.some((pattern) => pattern.test(cmd));
+        }
+        catch {
+            return false; // ps failed — process likely dead or not accessible
+        }
+    }
+    _cleanupOrphanedPids() {
+        try {
+            if (!fs.existsSync(SessionManager.PID_FILE))
+                return;
+            const data = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8'));
+            for (const [name, pid] of Object.entries(data)) {
+                try {
+                    process.kill(pid, 0); // check if alive
+                    // Alive — but verify it's actually a coding CLI, not a recycled PID
+                    if (!this._isKnownCliProcess(pid)) {
+                        this.logger.info(`PID ${pid} (session: ${name}) is alive but not a known CLI — skipping kill`);
+                        continue;
+                    }
+                    this.logger.info(`Killing orphaned process ${pid} (session: ${name})`);
+                    // Graceful shutdown: SIGTERM first
+                    try {
+                        process.kill(-pid, 'SIGTERM');
+                    }
+                    catch {
+                        /* group kill failed */
+                    }
+                    try {
+                        process.kill(pid, 'SIGTERM');
+                    }
+                    catch {
+                        /* individual kill failed */
+                    }
+                    // Give process time to shut down, then SIGKILL
+                    setTimeout(() => {
+                        try {
+                            process.kill(pid, 0);
+                            process.kill(-pid, 'SIGKILL');
+                        }
+                        catch {
+                            /* already dead or group kill failed */
+                        }
+                        try {
+                            process.kill(pid, 0);
+                            process.kill(pid, 'SIGKILL');
+                        }
+                        catch {
+                            /* already dead */
+                        }
+                    }, STOP_SIGKILL_DELAY_MS);
+                }
+                catch {
+                    // Process already dead — nothing to do
+                }
+            }
+        }
+        catch {
+            /* file doesn't exist or parse error */
+        }
+        // Clear the PID file
+        this._savePids();
+    }
+    // Circuit breaker is delegated to this._circuitBreaker (src/circuit-breaker.ts)
+    _getSession(name) {
+        const managed = this.sessions.get(name);
+        if (!managed)
+            throw new Error(`Session '${name}' not found`);
+        return managed;
+    }
+    _toSessionInfo(name, managed) {
+        const stats = managed.session.getStats();
+        return {
+            name,
+            claudeSessionId: managed.claudeSessionId,
+            created: managed.created,
+            cwd: managed.cwd,
+            model: managed.config.resolvedModel || managed.config.model,
+            paused: false,
+            stats,
+        };
+    }
+    _resolveModel(alias, overrides) {
+        if (overrides?.[alias])
+            return overrides[alias];
+        return resolveAlias(alias);
+    }
+    _listMdFiles(dir) {
+        if (!fs.existsSync(dir))
+            return [];
+        return fs
+            .readdirSync(dir)
+            .filter((f) => f.endsWith('.md'))
+            .map((f) => {
+            const content = fs.readFileSync(path.join(dir, f), 'utf8');
+            const match = content.match(/^---\n[\s\S]*?description:\s*(.+)/m);
+            return { name: f.replace('.md', ''), file: f, description: match?.[1]?.trim() || '' };
+        });
+    }
+    _createSession(engine, config) {
+        switch (engine) {
+            case 'gemini':
+                return new PersistentGeminiSession(config, process.env.GEMINI_BIN);
+            case 'codex':
+                return new PersistentCodexSession(config, process.env.CODEX_BIN);
+            case 'cursor':
+                return new PersistentCursorSession(config, process.env.CURSOR_BIN);
+            case 'custom':
+                // SECURITY FIX: custom engines allow arbitrary binary execution with
+                // arbitrary arguments and environment variables. Disabled by default.
+                if (process.env.OPENCLAW_ALLOW_CUSTOM_ENGINES !== '1') {
+                    throw new Error('Custom engine support is disabled for security. ' +
+                        'Set OPENCLAW_ALLOW_CUSTOM_ENGINES=1 to enable at your own risk.');
+                }
+                if (!config.customEngine)
+                    throw new Error('customEngine config is required for engine type "custom"');
+                return new PersistentCustomSession(config);
+            case 'claude':
+            default:
+                return new PersistentClaudeSession(config, this.pluginConfig.claudeBin);
+        }
+    }
+    // ─── Council ──────────────────────────────────────────────────────────
+    councils = new Map();
+    councilCleanupTimers = new Map();
+    councilStart(task, config) {
+        const council = new Council(config, this, this.logger);
+        const initialSession = council.init(task);
+        // Store BEFORE running so council_status/abort/inject work while it's active
+        this.councils.set(initialSession.id, council);
+        // Run in background — callers poll via councilStatus()
+        council
+            .run()
+            .then(() => {
+            // Keep completed council queryable; schedule cleanup after TTL
+            this._scheduleCouncilCleanup(initialSession.id);
+        })
+            .catch((err) => {
+            this.logger.error(`Council ${initialSession.id} failed:`, err);
+            this._scheduleCouncilCleanup(initialSession.id);
+        });
+        return initialSession;
+    }
+    _scheduleCouncilCleanup(id) {
+        // Clear any existing timer before scheduling a new one
+        const existing = this.councilCleanupTimers.get(id);
+        if (existing)
+            clearTimeout(existing);
+        const timer = setTimeout(() => {
+            // Abort if still running to prevent orphaned background tasks
+            const council = this.councils.get(id);
+            if (council) {
+                const session = council.getSession();
+                if (session?.status === 'running') {
+                    this.logger.info(`Council ${id} still running at TTL expiry — aborting`);
+                    council.abort();
+                }
+            }
+            this.councils.delete(id);
+            this.councilCleanupTimers.delete(id);
+        }, RESULT_TTL_MS);
+        this.councilCleanupTimers.set(id, timer);
+    }
+    councilStatus(id) {
+        const council = this.councils.get(id);
+        return council?.getSession();
+    }
+    councilAbort(id) {
+        const council = this.councils.get(id);
+        if (!council)
+            throw new Error(`Council '${id}' not found`);
+        council.abort();
+        this.councils.delete(id);
+    }
+    councilInject(id, message) {
+        const council = this.councils.get(id);
+        if (!council)
+            throw new Error(`Council '${id}' not found`);
+        council.injectMessage(message);
+    }
+    async councilReview(id) {
+        const council = this.councils.get(id);
+        if (!council)
+            throw new Error(`Council '${id}' not found`);
+        this._scheduleCouncilCleanup(id); // reset TTL — user is actively reviewing
+        return council.review();
+    }
+    async councilAccept(id) {
+        const council = this.councils.get(id);
+        if (!council)
+            throw new Error(`Council '${id}' not found`);
+        const result = await council.accept();
+        // Accepted — no longer needed, clean up after short grace period
+        this._scheduleCouncilCleanup(id);
+        return result;
+    }
+    async councilReject(id, feedback) {
+        const council = this.councils.get(id);
+        if (!council)
+            throw new Error(`Council '${id}' not found`);
+        const result = await council.reject(feedback);
+        this._scheduleCouncilCleanup(id); // reset TTL — council may be restarted
+        return result;
+    }
+    // ─── Inbox (cross-session messaging) — delegated to InboxManager ────
+    get _sessionLookup() {
+        return {
+            getSession: (name) => this.sessions.get(name),
+            exists: (name) => this.sessions.has(name),
+            allNames: () => this.sessions.keys(),
+        };
+    }
+    async sessionSendTo(from, to, message, summary) {
+        return this._inbox.sendTo(from, to, message, this._sessionLookup, summary, (name, err) => {
+            this.logger.error(`Broadcast delivery to '${name}' failed:`, err.message);
+        });
+    }
+    sessionInbox(name, unreadOnly = true) {
+        return this._inbox.inbox(name, unreadOnly);
+    }
+    async sessionDeliverInbox(name) {
+        return this._inbox.deliverInbox(name, this._sessionLookup);
+    }
+    // ─── Ultraplan ────────────────────────────────────────────────────────
+    ultraplans = new Map();
+    ultraplanStart(task, opts) {
+        const id = `ultraplan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const sessionName = `ultraplan-${id}`;
+        const timeout = opts?.timeout || ULTRAPLAN_TIMEOUT_MS;
+        const result = {
+            id,
+            status: 'running',
+            sessionName,
+            startTime: new Date().toISOString(),
+        };
+        this.ultraplans.set(id, result);
+        // Run in background
+        this._runUltraplan(id, sessionName, task, opts?.model || 'opus', opts?.cwd || process.cwd(), timeout)
+            .catch((err) => {
+            result.status = 'error';
+            result.error = err.message;
+            result.endTime = new Date().toISOString();
+        })
+            .finally(() => {
+            // Cleanup session
+            this.stopSession(sessionName).catch((err) => {
+                this.logger.error(`Failed to stop ultraplan session '${sessionName}':`, err);
+            });
+            setTimeout(() => {
+                // Mark as error if still running at TTL expiry
+                const plan = this.ultraplans.get(id);
+                if (plan?.status === 'running') {
+                    this.logger.info(`Ultraplan ${id} still running at TTL expiry — marking as error`);
+                    plan.status = 'error';
+                    plan.error = 'Timed out (TTL expired)';
+                    plan.endTime = new Date().toISOString();
+                }
+                this.ultraplans.delete(id);
+            }, RESULT_TTL_MS);
+        });
+        return result;
+    }
+    async _runUltraplan(id, sessionName, task, model, cwd, timeout) {
+        const result = this.ultraplans.get(id);
+        await this.startSession({
+            name: sessionName,
+            cwd,
+            model,
+            permissionMode: 'plan',
+            effort: 'max',
+            appendSystemPrompt: 'You are in ultraplan mode. Explore the project thoroughly, analyze feasibility, and produce a detailed, actionable plan. Do NOT write code — plan only. Output your final plan in a clear markdown format.',
+        });
+        const planPrompt = `# Ultraplan Task\n\n${task}\n\nExplore the project, understand the codebase, analyze feasibility, and produce a comprehensive implementation plan. Take your time (up to 30 minutes). Be thorough.`;
+        const sendResult = await this.sendMessage(sessionName, planPrompt, { timeout });
+        // Detect error responses: empty output or output that looks like an error message
+        const output = sendResult.output?.trim() || '';
+        const looksLikeError = !output ||
+            /^(Error|not logged in|authentication|auth failed|permission denied)/i.test(output) ||
+            (sendResult.error && sendResult.error.length > 0);
+        if (looksLikeError) {
+            result.status = 'error';
+            result.error = sendResult.error || output || 'Empty response from engine';
+        }
+        else {
+            result.plan = output;
+            result.status = 'completed';
+        }
+        result.endTime = new Date().toISOString();
+    }
+    ultraplanStatus(id) {
+        return this.ultraplans.get(id);
+    }
+    // ─── Ultrareview ──────────────────────────────────────────────────────
+    ultrareviews = new Map();
+    ultrareviewPollers = new Map();
+    ultrareviewStart(cwd, opts) {
+        const id = `ultrareview-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const agentCount = Math.min(20, Math.max(1, opts?.agentCount || 5));
+        const result = {
+            id,
+            status: 'running',
+            councilId: '',
+            agentCount,
+            startTime: new Date().toISOString(),
+        };
+        this.ultrareviews.set(id, result);
+        // Build reviewer agents
+        const reviewAngles = [
+            {
+                name: 'SecurityReviewer',
+                emoji: '🔒',
+                persona: 'You are a security expert. Focus on: injection vulnerabilities, auth flaws, data exposure, OWASP top 10, secrets in code.',
+            },
+            {
+                name: 'LogicReviewer',
+                emoji: '🧠',
+                persona: 'You are a logic analyst. Focus on: off-by-one errors, race conditions, null/undefined handling, edge cases, incorrect assumptions.',
+            },
+            {
+                name: 'PerformanceReviewer',
+                emoji: '⚡',
+                persona: 'You are a performance engineer. Focus on: O(n^2) loops, memory leaks, unnecessary allocations, missing caching, N+1 queries.',
+            },
+            {
+                name: 'APIReviewer',
+                emoji: '🔌',
+                persona: 'You are an API design reviewer. Focus on: inconsistent interfaces, missing validation, error handling gaps, backwards compatibility.',
+            },
+            {
+                name: 'TestReviewer',
+                emoji: '🧪',
+                persona: 'You are a test coverage analyst. Focus on: untested code paths, missing edge case tests, flaky test patterns, assertion quality.',
+            },
+            {
+                name: 'TypeReviewer',
+                emoji: '📐',
+                persona: 'You are a type safety reviewer. Focus on: any casts, unsafe assertions, missing null checks, generic misuse, type narrowing gaps.',
+            },
+            {
+                name: 'ConcurrencyReviewer',
+                emoji: '🔀',
+                persona: 'You are a concurrency expert. Focus on: race conditions, deadlocks, shared state mutations, async error handling, promise leaks.',
+            },
+            {
+                name: 'ErrorReviewer',
+                emoji: '💥',
+                persona: 'You are an error handling reviewer. Focus on: swallowed errors, missing try/catch, unhelpful error messages, crash-on-startup paths.',
+            },
+            {
+                name: 'DependencyReviewer',
+                emoji: '📦',
+                persona: 'You are a dependency auditor. Focus on: outdated packages, known CVEs, unnecessary dependencies, license issues.',
+            },
+            {
+                name: 'ReadabilityReviewer',
+                emoji: '📖',
+                persona: 'You are a readability reviewer. Focus on: unclear naming, complex functions, missing context, dead code, confusing control flow.',
+            },
+            {
+                name: 'DataReviewer',
+                emoji: '💾',
+                persona: 'You are a data integrity reviewer. Focus on: data validation, schema mismatches, migration issues, encoding problems, data loss paths.',
+            },
+            {
+                name: 'ConfigReviewer',
+                emoji: '⚙️',
+                persona: 'You are a configuration reviewer. Focus on: hardcoded values, missing env vars, insecure defaults, missing fallbacks.',
+            },
+            {
+                name: 'ScalabilityReviewer',
+                emoji: '📈',
+                persona: 'You are a scalability reviewer. Focus on: single points of failure, stateful bottlenecks, missing pagination, unbounded growth.',
+            },
+            {
+                name: 'DocReviewer',
+                emoji: '📝',
+                persona: 'You are a documentation reviewer. Focus on: outdated docs, missing API docs, misleading comments, undocumented behavior.',
+            },
+            {
+                name: 'A11yReviewer',
+                emoji: '♿',
+                persona: 'You are an accessibility reviewer. Focus on: missing ARIA labels, keyboard navigation, color contrast, screen reader support.',
+            },
+            {
+                name: 'I18nReviewer',
+                emoji: '🌍',
+                persona: 'You are an i18n reviewer. Focus on: hardcoded strings, locale handling, date/number formatting, RTL support.',
+            },
+            {
+                name: 'NetworkReviewer',
+                emoji: '🌐',
+                persona: 'You are a network reviewer. Focus on: missing timeouts, retry logic, connection pooling, request size limits.',
+            },
+            {
+                name: 'AuthReviewer',
+                emoji: '🔑',
+                persona: 'You are an auth reviewer. Focus on: token handling, session management, CSRF protection, permission checks.',
+            },
+            {
+                name: 'CryptoReviewer',
+                emoji: '🔐',
+                persona: 'You are a cryptography reviewer. Focus on: weak algorithms, key management, random number generation, hash collisions.',
+            },
+            {
+                name: 'MemoryReviewer',
+                emoji: '🧹',
+                persona: 'You are a memory reviewer. Focus on: memory leaks, circular references, large object retention, stream handling.',
+            },
+        ];
+        const agents = reviewAngles.slice(0, agentCount).map((a) => ({
+            ...a,
+            model: opts?.model,
+        }));
+        const maxMinutes = Math.min(25, Math.max(5, opts?.maxDurationMinutes || 10));
+        const focus = opts?.focus || 'Find bugs, security issues, and code quality problems';
+        const councilConfig = {
+            name: 'ultrareview',
+            agents,
+            maxRounds: 2, // Review doesn't need many rounds — find bugs, then synthesize
+            projectDir: cwd,
+            agentTimeoutMs: maxMinutes * 60 * 1000,
+            maxTurnsPerAgent: 20,
+        };
+        const councilSession = this.councilStart(`# Code Review Task\n\nReview the codebase in this project. ${focus}.\n\nEach reviewer: examine the code from your specialty angle, report bugs found with file paths and line numbers. Vote [CONSENSUS: YES] when your review is complete.`, councilConfig);
+        result.councilId = councilSession.id;
+        // Poll council for completion (store ref for shutdown cleanup)
+        const pollInterval = setInterval(() => {
+            try {
+                const status = this.councilStatus(councilSession.id);
+                if (!status || status.status === 'running')
+                    return;
+                clearInterval(pollInterval);
+                this.ultrareviewPollers.delete(id);
+                result.status = status.status === 'error' ? 'error' : 'completed';
+                result.endTime = new Date().toISOString();
+                // Synthesize findings from all agent responses
+                if (status.responses.length > 0) {
+                    result.findings = status.responses.map((r) => `## ${r.agent}\n\n${r.content}`).join('\n\n---\n\n');
+                }
+                setTimeout(() => this.ultrareviews.delete(id), RESULT_TTL_MS);
+            }
+            catch {
+                // Council may have been cleaned up; stop polling
+                clearInterval(pollInterval);
+                this.ultrareviewPollers.delete(id);
+            }
+        }, ULTRAREVIEW_POLL_INTERVAL_MS);
+        this.ultrareviewPollers.set(id, pollInterval);
+        return result;
+    }
+    ultrareviewStatus(id) {
+        return this.ultrareviews.get(id);
+    }
+    _cleanupIdleSessions() {
+        const ttlMs = this.pluginConfig.sessionTtlMinutes * 60_000;
+        const now = Date.now();
+        for (const [name, managed] of this.sessions) {
+            if (now - managed.lastActivity > ttlMs) {
+                this.logger.info(`Cleaning up idle in-memory session: ${name}`);
+                try {
+                    managed.session.stop();
+                }
+                catch {
+                    // Best-effort — session may already be dead; must not block TTL cleanup
+                }
+                this.sessions.delete(name);
+                // NOTE: do NOT delete from persistedSessions — idle cleanup is
+                // in-memory only. Persisted entries survive for PERSIST_DISK_TTL_MS
+                // (7 days) so the session can be resumed after a gateway restart.
+            }
+        }
+        // Prune disk entries that exceeded the longer disk TTL
+        let pruned = false;
+        for (const [name, entry] of this.persistedSessions) {
+            if (now - entry.lastActivity > PERSIST_DISK_TTL_MS) {
+                this.persistedSessions.delete(name);
+                pruned = true;
+            }
+        }
+        if (pruned)
+            savePersistedSessionsAsync(this.persistedSessions);
+    }
+}
+//# sourceMappingURL=session-manager.js.map

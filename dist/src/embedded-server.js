@@ -1,0 +1,363 @@
+/**
+ * Embedded HTTP Server — auto-starts with plugin, serves CLI commands
+ *
+ * This is NOT a separate process. It runs inside the plugin (or standalone)
+ * and provides HTTP endpoints for the CLI to connect to.
+ *
+ * Users never need to configure or manage this — it just works.
+ */
+import * as http from 'node:http';
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { sanitizeCwd, validateRegex } from './validation.js';
+import { handleChatCompletion } from './openai-compat.js';
+import { getModelList } from './models.js';
+import { DEFAULT_SERVER_PORT, MAX_BODY_SIZE, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS, OPENAI_COMPAT_SESSION_PREFIX, } from './constants.js';
+export class EmbeddedServer {
+    server = null;
+    manager;
+    port;
+    authToken = null;
+    _rateWindows = new Map();
+    _rateLimitCleanupTimer = null;
+    _rateLimit;
+    host;
+    constructor(manager, port, host) {
+        this.manager = manager;
+        this.port = port || DEFAULT_SERVER_PORT;
+        this.host = host || process.env.OPENCLAW_SERVER_HOST || '127.0.0.1';
+        this._rateLimit = parseInt(process.env.OPENCLAW_RATE_LIMIT || '', 10) || RATE_LIMIT_MAX_REQUESTS;
+    }
+    _checkRateLimit(ip) {
+        const now = Date.now();
+        const window = this._rateWindows.get(ip) || [];
+        const recent = window.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+        recent.push(now);
+        this._rateWindows.set(ip, recent);
+        return recent.length <= this._rateLimit;
+    }
+    async start() {
+        // Auth token: opt-in via OPENCLAW_SERVER_TOKEN env var.
+        // When set, all requests (except /health) must include Authorization: Bearer <token>.
+        // Default: no auth (localhost-only is the primary security boundary).
+        const envToken = process.env.OPENCLAW_SERVER_TOKEN;
+        if (envToken) {
+            this.authToken = envToken;
+            // Write token to file for CLI to read
+            const tokenDir = path.join(os.homedir(), '.openclaw');
+            try {
+                if (!fs.existsSync(tokenDir))
+                    fs.mkdirSync(tokenDir, { recursive: true });
+                fs.writeFileSync(path.join(tokenDir, 'server-token'), this.authToken, { mode: 0o600 });
+            }
+            catch {
+                /* best effort */
+            }
+        }
+        else {
+            this.authToken = null;
+        }
+        this._rateLimitCleanupTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [ip, timestamps] of this._rateWindows) {
+                const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+                if (recent.length === 0)
+                    this._rateWindows.delete(ip);
+                else
+                    this._rateWindows.set(ip, recent);
+            }
+        }, RATE_LIMIT_WINDOW_MS);
+        this._rateLimitCleanupTimer.unref();
+        return new Promise((resolve, reject) => {
+            this.server = http.createServer((req, res) => this.handleRequest(req, res));
+            this.server.on('error', (err) => {
+                if (err.code === 'EADDRINUSE') {
+                    // Port already in use — another instance running, skip
+                    console.log(`[embedded-server] Port ${this.port} in use, skipping (another instance running)`);
+                    this.server = null;
+                    resolve(0);
+                }
+                else {
+                    reject(err);
+                }
+            });
+            this.server.listen(this.port, this.host, () => {
+                console.log(`[embedded-server] Listening on http://${this.host}:${this.port}${this.authToken ? ' (auth enabled)' : ''}`);
+                resolve(this.port);
+            });
+        });
+    }
+    async stop() {
+        if (this._rateLimitCleanupTimer) {
+            clearInterval(this._rateLimitCleanupTimer);
+            this._rateLimitCleanupTimer = null;
+        }
+        // Only delete token file if it matches our token
+        try {
+            const tokenPath = path.join(os.homedir(), '.openclaw', 'server-token');
+            const stored = fs.readFileSync(tokenPath, 'utf8');
+            if (stored === this.authToken)
+                fs.unlinkSync(tokenPath);
+        }
+        catch {
+            /* ignore */
+        }
+        if (!this.server)
+            return;
+        return new Promise((resolve) => {
+            this.server.close(() => resolve());
+        });
+    }
+    handleRequest(req, res) {
+        // CORS — localhost only by default
+        const origin = req.headers.origin || '';
+        const corsAllowAll = process.env.OPENCLAW_CORS_ORIGINS === '*';
+        // SECURITY FIX: /v1/ paths no longer get blanket CORS.
+        // Only localhost origins or explicit OPENCLAW_CORS_ORIGINS=* are allowed.
+        const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$/.test(origin);
+        if (isLocalhost || corsAllowAll) {
+            res.setHeader('Access-Control-Allow-Origin', origin || '*');
+        }
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        if (req.method === 'OPTIONS') {
+            res.writeHead(200);
+            res.end();
+            return;
+        }
+        const url = new URL(req.url || '/', `http://localhost:${this.port}`);
+        const path = url.pathname;
+        // Bearer token auth (skip for health checks)
+        if (this.authToken && path !== '/health') {
+            const authHeader = req.headers.authorization || '';
+            const expected = Buffer.from(`Bearer ${this.authToken}`);
+            const received = Buffer.from(authHeader);
+            if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'Unauthorized — provide Authorization: Bearer <token>' }));
+                return;
+            }
+        }
+        // Rate limiting
+        const clientIp = req.socket.remoteAddress || 'unknown';
+        if (!this._checkRateLimit(clientIp)) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Rate limit exceeded' }));
+            return;
+        }
+        // Read body for POST — require JSON content type (CSRF mitigation)
+        if (req.method === 'POST') {
+            const contentType = req.headers['content-type'] || '';
+            if (!contentType.includes('application/json')) {
+                res.writeHead(415, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+                return;
+            }
+            let body = '';
+            let aborted = false;
+            req.on('data', (chunk) => {
+                if (aborted)
+                    return;
+                body += chunk;
+                if (body.length > MAX_BODY_SIZE) {
+                    aborted = true;
+                    res.writeHead(413, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
+                    req.destroy();
+                }
+            });
+            req.on('end', () => {
+                if (aborted)
+                    return;
+                let parsed = {};
+                try {
+                    parsed = JSON.parse(body || '{}');
+                }
+                catch {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
+                    return;
+                }
+                this.route(path, parsed, url.searchParams, res, req.headers);
+            });
+        }
+        else {
+            this.route(path, {}, url.searchParams, res, req.headers);
+        }
+    }
+    async route(path, body, query, res, headers = {}) {
+        try {
+            const json = (status, data) => {
+                res.writeHead(status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(data));
+            };
+            // ─── Session Routes ──────────────────────────────────────────
+            if (path === '/session/start') {
+                if (body.cwd)
+                    body.cwd = sanitizeCwd(body.cwd);
+                const info = await this.manager.startSession(body);
+                json(200, { ok: true, ...info });
+                return;
+            }
+            if (path === '/session/send') {
+                const result = await this.manager.sendMessage(body.name, body.message, {
+                    effort: body.effort,
+                    plan: body.plan,
+                    timeout: body.timeout,
+                });
+                json(200, { ok: true, ...result });
+                return;
+            }
+            if (path === '/session/stop') {
+                await this.manager.stopSession(body.name);
+                json(200, { ok: true });
+                return;
+            }
+            if (path === '/session/list') {
+                json(200, { ok: true, sessions: this.manager.listSessions() });
+                return;
+            }
+            if (path === '/session/status') {
+                const status = this.manager.getStatus(body.name);
+                json(200, { ok: true, ...status });
+                return;
+            }
+            if (path === '/session/grep') {
+                validateRegex(body.pattern);
+                const matches = await this.manager.grepSession(body.name, body.pattern, body.limit);
+                json(200, { ok: true, count: matches.length, matches });
+                return;
+            }
+            if (path === '/session/compact') {
+                await this.manager.compactSession(body.name, body.summary);
+                json(200, { ok: true });
+                return;
+            }
+            if (path === '/session/cost') {
+                const cost = this.manager.getCost(body.name);
+                json(200, { ok: true, ...cost });
+                return;
+            }
+            if (path === '/session/model') {
+                this.manager.setModel(body.name, body.model);
+                json(200, { ok: true });
+                return;
+            }
+            if (path === '/session/effort') {
+                this.manager.setEffort(body.name, body.level);
+                json(200, { ok: true });
+                return;
+            }
+            // ─── Agent Teams ─────────────────────────────────────────────
+            if (path === '/session/team-list') {
+                const response = await this.manager.teamList(body.name);
+                json(200, { ok: true, response });
+                return;
+            }
+            if (path === '/session/team-send') {
+                const result = await this.manager.teamSend(body.name, body.teammate, body.message);
+                json(200, { ok: true, ...result });
+                return;
+            }
+            // ─── File Management ─────────────────────────────────────────
+            if (path === '/agents') {
+                const cwd = query.get('cwd') || undefined;
+                json(200, { ok: true, agents: this.manager.listAgents(cwd) });
+                return;
+            }
+            if (path === '/agents/create') {
+                const p = this.manager.createAgent(body.name, body.cwd, body.description, body.prompt);
+                json(200, { ok: true, path: p });
+                return;
+            }
+            if (path === '/skills') {
+                const cwd = query.get('cwd') || undefined;
+                json(200, { ok: true, skills: this.manager.listSkills(cwd) });
+                return;
+            }
+            if (path === '/skills/create') {
+                const p = this.manager.createSkill(body.name, body.cwd, body);
+                json(200, { ok: true, path: p });
+                return;
+            }
+            if (path === '/rules') {
+                const cwd = query.get('cwd') || undefined;
+                json(200, { ok: true, rules: this.manager.listRules(cwd) });
+                return;
+            }
+            if (path === '/rules/create') {
+                const p = this.manager.createRule(body.name, body.cwd, body);
+                json(200, { ok: true, path: p });
+                return;
+            }
+            // ─── Health ──────────────────────────────────────────────────
+            if (path === '/health') {
+                json(200, { ok: true, version: this.manager.getVersion(), sessions: this.manager.listSessions().length });
+                return;
+            }
+            // ─── OpenAI-Compatible Routes ─────────────────────────────
+            if (path === '/v1/chat/completions') {
+                await handleChatCompletion(this.manager, body, headers, res);
+                return;
+            }
+            if (path === '/v1/models') {
+                json(200, getModelList());
+                return;
+            }
+            if (path === '/v1/sessions') {
+                // Inspection endpoint for openai-compat sessions only — not interactive
+                // CLI sessions. Production observability: lets ops verify the persistent
+                // CLI is being reused (cached_tokens grows turn-over-turn) instead of
+                // killed every request. Bearer-token gated like the rest of /v1/*.
+                const rows = this.manager
+                    .listSessions()
+                    .filter((s) => s.name.startsWith(OPENAI_COMPAT_SESSION_PREFIX))
+                    .map((s) => {
+                    let stats = null;
+                    try {
+                        stats = this.manager.getStatus(s.name).stats;
+                    }
+                    catch {
+                        /* session may have just been reaped */
+                    }
+                    return {
+                        key: s.name.slice(OPENAI_COMPAT_SESSION_PREFIX.length),
+                        session_name: s.name,
+                        model: s.model,
+                        cwd: s.cwd,
+                        created: s.created,
+                        turns: stats?.turns,
+                        tokens_in: stats?.tokensIn,
+                        tokens_out: stats?.tokensOut,
+                        cached_tokens: stats?.cachedTokens,
+                        context_percent: stats?.contextPercent,
+                        cost_usd: stats?.costUsd,
+                    };
+                });
+                json(200, { object: 'list', data: rows });
+                return;
+            }
+            // Use OpenAI error format for /v1/* paths
+            if (path.startsWith('/v1/')) {
+                json(404, { error: { message: 'Not found', type: 'invalid_request_error', code: null } });
+            }
+            else {
+                json(404, { ok: false, error: 'Not found' });
+            }
+        }
+        catch (err) {
+            const message = err.message;
+            if (path.startsWith('/v1/')) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message, type: 'server_error', code: null } }));
+            }
+            else {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: message }));
+            }
+        }
+    }
+}
+//# sourceMappingURL=embedded-server.js.map

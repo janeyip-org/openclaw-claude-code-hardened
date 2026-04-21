@@ -1,8 +1,8 @@
 # Dependencies
 node_modules/
 
-# Build output
-dist/
+# Build output — dist/ is tracked so `npm install` from GitHub URLs works.
+# GitHub installs don't run prepublishOnly, so pre-built files must be committed.
 
 # IDE
 .vscode/
