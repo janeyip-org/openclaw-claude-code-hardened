@@ -8,6 +8,7 @@
  */
 
 import * as http from 'node:http';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -150,7 +151,7 @@ export class EmbeddedServer {
       const authHeader = req.headers.authorization || '';
       const expected = Buffer.from(`Bearer ${this.authToken}`);
       const received = Buffer.from(authHeader);
-      if (expected.length !== received.length || !require('node:crypto').timingSafeEqual(expected, received)) {
+      if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'Unauthorized — provide Authorization: Bearer <token>' }));
         return;
